@@ -181,6 +181,14 @@ The static build goes to `public/`. The build also creates the matching HTML
 shell used for public profile rendering. Treat both outputs as one release
 artifact.
 
+### GitHub Pages
+
+For the repository site at `https://aromalsp123.github.io/Book-tracker/`, set
+**Settings → Pages → Build and deployment → Source** to **GitHub Actions**.
+The workflow in `.github/workflows/pages.yml` builds the app with the repository
+path as its asset base and deploys the generated `public/` directory whenever
+`main` is updated. Local builds continue to use the domain root.
+
 ## Testing
 
 Run the default test suite:

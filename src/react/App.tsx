@@ -167,7 +167,7 @@ function BookForm({ onAdd, onClose }: { onAdd: (book: LocalBook) => void; onClos
 function LandingIllustration() {
   return <img
     className="landing-illustration"
-    src="/images/landing-books-rabbit.png"
+    src={`${import.meta.env.BASE_URL}images/landing-books-rabbit.png`}
     alt="A vintage blue engraving of a rabbit perched on a stack of books surrounded by foliage"
     width="922"
     height="768"
@@ -210,7 +210,7 @@ function LandingPage({ onEnter, onSearch }: { onEnter: () => void; onSearch: (qu
     </section>
     <section className="landing-story-section" id="how-it-works">
       <div className="story-intro"><p className="eyebrow">A READING JOURNAL, NOT A RACE</p><h2>There’s no right way<br />to read a book.</h2><p>Some days you’ll turn a dozen pages. Some weeks, you’ll simply choose your next story. MARGIN helps you keep a gentle record of it all, without turning reading into another thing to keep up with.</p><button className="text-link" type="button" onClick={onEnter}>Make a little room for reading <Icon name="arrow-right" /></button></div>
-      <div className="story-card"><img className="story-illustration" src="/images/reading-journal-still-life.png" alt="An open reading journal, books, a teacup, and flowers in a vintage blue engraving style" width="1774" height="887" loading="lazy" /></div>
+      <div className="story-card"><img className="story-illustration" src={`${import.meta.env.BASE_URL}images/reading-journal-still-life.png`} alt="An open reading journal, books, a teacup, and flowers in a vintage blue engraving style" width="1774" height="887" loading="lazy" /></div>
     </section>
     <section className="landing-about" id="about"><p className="eyebrow">MADE FOR READERS</p><h2>Your reading life belongs to you.</h2><p>MARGIN keeps your journal in this browser. No public profile, no pressure, no noise—just a calm place to keep track of the books you love.</p><button className="button landing-cta" type="button" onClick={onEnter}>Open your journal <Icon name="arrow-right" /></button></section>
     <footer className="landing-footer">
@@ -337,6 +337,13 @@ function App() {
     setNow(Date.now());
   }
 
+  function removeBook(id: string) {
+    const book = tracker.books.find((item) => item.id === id);
+    if (!book || !window.confirm(`Remove “${book.title}” and its saved sessions and quotes?`)) return;
+    tracker.removeBook(id);
+    setSelectedBookId((selectedId) => selectedId === id ? null : selectedId);
+  }
+
   function saveQuote(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!quoteText.trim() || !quoteBookId) return;
@@ -412,12 +419,7 @@ function App() {
           onProgress={(page) => tracker.updateProgress(selectedBook.id, page)}
           onStatus={(status) => tracker.updateStatus(selectedBook.id, status)}
           onDescription={(description) => tracker.updateDescription(selectedBook.id, description)}
-          onDelete={() => {
-            if (window.confirm(`Remove “${selectedBook.title}” and its saved sessions and quotes?`)) {
-              tracker.removeBook(selectedBook.id);
-              setSelectedBookId(null);
-            }
-          }}
+          onDelete={() => removeBook(selectedBook.id)}
           onStart={() => startSession(selectedBook.id)}
           onStop={stopSession}
           onQuotes={() => { setQuoteBookId(selectedBook.id); openView('quotes'); }}
@@ -440,6 +442,7 @@ function App() {
             onStart={startSession}
             onStop={stopSession}
             onAdd={() => setAddBookOpen(true)}
+            onDeleteBook={removeBook}
           />}
           {view === 'library' && <Library
             books={filteredBooks}
@@ -447,6 +450,7 @@ function App() {
             onFilter={setFilter}
             onOpen={(id) => setSelectedBookId(id)}
             onAdd={() => setAddBookOpen(true)}
+            onDeleteBook={removeBook}
             query={query}
           />}
           {view === 'sessions' && <Sessions
@@ -508,7 +512,7 @@ function subtitleFor(view: View) {
   return subtitles[view];
 }
 
-function Dashboard({ books, sessions, totalReadingSeconds, quotesCount, activeBook, activeSession, elapsed, onOpenLibrary, onOpenBook, onStart, onStop, onAdd }: {
+function Dashboard({ books, sessions, totalReadingSeconds, quotesCount, activeBook, activeSession, elapsed, onOpenLibrary, onOpenBook, onDeleteBook, onStart, onStop, onAdd }: {
   books: LocalBook[];
   sessions: { id: string; bookId: string; startedAt: string; durationSeconds: number }[];
   totalReadingSeconds: number;
@@ -518,6 +522,7 @@ function Dashboard({ books, sessions, totalReadingSeconds, quotesCount, activeBo
   elapsed: number;
   onOpenLibrary: () => void;
   onOpenBook: (id: string) => void;
+  onDeleteBook: (id: string) => void;
   onStart: (id: string) => void;
   onStop: () => void;
   onAdd: () => void;
@@ -548,7 +553,7 @@ function Dashboard({ books, sessions, totalReadingSeconds, quotesCount, activeBo
     </div>
     <section className="shelf-section">
       <div className="section-heading shelf-heading"><div><p className="eyebrow">A FEW FROM YOUR SHELF</p><h2>My library</h2></div><button className="text-link" type="button" onClick={onOpenLibrary}>View all <Icon name="arrow-right" /></button></div>
-      {recentBooks.length ? <div className="book-shelf">{recentBooks.map((book) => <BookTile key={book.id} book={book} onOpen={() => onOpenBook(book.id)} />)}
+      {recentBooks.length ? <div className="book-shelf">{recentBooks.map((book) => <BookTile key={book.id} book={book} onOpen={() => onOpenBook(book.id)} onDelete={() => onDeleteBook(book.id)} />)}
         <button className="add-shelf-tile" type="button" onClick={onAdd}><span><Icon name="plus" /></span><small>Add a book</small></button>
       </div> : <div className="shelf-empty"><p>Your shelf is ready when you are.</p><button className="text-link" type="button" onClick={onAdd}>Add a book <Icon name="arrow-right" /></button></div>}
     </section>
@@ -563,27 +568,33 @@ function StatCard({ icon, value, label }: { icon: IconName; value: string; label
   return <article className="stat-card"><span className="stat-icon"><Icon name={icon} /></span><div><strong>{value}</strong><span>{label}</span></div></article>;
 }
 
-function BookTile({ book, onOpen }: { book: LocalBook; onOpen: () => void }) {
+function BookTile({ book, onOpen, onDelete }: { book: LocalBook; onOpen: () => void; onDelete: () => void }) {
   const percent = book.totalPages ? Math.round(((book.currentPage ?? 0) / book.totalPages) * 100) : null;
-  return <button className="book-tile" type="button" onClick={onOpen}>
-    <Cover book={book} />
-    <strong>{book.title}</strong><span className="tile-author">{book.author}</span>
+  return <article className="book-tile">
+    <div className="book-tile-cover">
+      <button className="tile-open-button" type="button" onClick={onOpen} aria-label={`Open ${book.title}`}>
+        <Cover book={book} />
+      </button>
+      <button className="tile-delete-button" type="button" aria-label={`Delete ${book.title}`} title={`Delete ${book.title}`} onClick={onDelete}><Icon name="trash" /></button>
+    </div>
+    <button className="tile-title-button" type="button" onClick={onOpen}>{book.title}</button><span className="tile-author">{book.author}</span>
     {book.status === 'Reading' && percent !== null ? <><div className="tile-progress"><span style={{ width: `${Math.min(100, percent)}%` }} /></div><span className="tile-status-line">{percent}% read</span></> : <StatusBadge status={book.status} />}
-  </button>;
+  </article>;
 }
 
-function Library({ books, filter, onFilter, onOpen, onAdd, query }: {
+function Library({ books, filter, onFilter, onOpen, onAdd, onDeleteBook, query }: {
   books: LocalBook[];
   filter: LibraryFilter;
   onFilter: (filter: LibraryFilter) => void;
   onOpen: (id: string) => void;
   onAdd: () => void;
+  onDeleteBook: (id: string) => void;
   query: string;
 }) {
   const filters: LibraryFilter[] = ['All books', 'Reading', 'Finished', 'To read'];
   return <section className="library-view">
     <div className="library-toolbar"><div className="filter-tabs" role="tablist" aria-label="Filter books">{filters.map((item) => <button key={item} type="button" role="tab" aria-selected={filter === item} className={filter === item ? 'selected' : ''} onClick={() => onFilter(item)}>{item}</button>)}</div><span className="book-count">{books.length} {books.length === 1 ? 'book' : 'books'}</span></div>
-    {books.length ? <div className="library-grid">{books.map((book) => <BookTile key={book.id} book={book} onOpen={() => onOpen(book.id)} />)}<button className="add-library-tile" type="button" onClick={onAdd}><span><Icon name="plus" /></span><strong>Add a book</strong><small>Make room for another story</small></button></div> :
+    {books.length ? <div className="library-grid">{books.map((book) => <BookTile key={book.id} book={book} onOpen={() => onOpen(book.id)} onDelete={() => onDeleteBook(book.id)} />)}<button className="add-library-tile" type="button" onClick={onAdd}><span><Icon name="plus" /></span><strong>Add a book</strong><small>Make room for another story</small></button></div> :
       <EmptyState title={query ? 'No books found.' : filter === 'All books' ? 'Your shelf is still a blank page.' : `No books marked “${filter}”.`} detail={query ? 'Try another title or author.' : 'Add a book to begin your personal reading collection.'} action={!query && <button className="button" type="button" onClick={onAdd}>Add a book <Icon name="arrow-right" /></button>} />}
   </section>;
 }

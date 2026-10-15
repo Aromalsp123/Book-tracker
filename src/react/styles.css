@@ -121,10 +121,17 @@ h1, h2, h3 { font-family: var(--serif); font-weight: 400; }
 .shelf-section { margin-top: 31px; }
 .shelf-heading { margin-bottom: 15px; }
 .book-shelf { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 17px; }
-.book-tile { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; padding: 0; border: 0; background: transparent; cursor: pointer; text-align: left; }
-.book-tile .cover { width: 100%; margin-bottom: 10px; transition: transform .18s ease, box-shadow .18s ease; }
+.book-tile { display: flex; position: relative; min-width: 0; flex-direction: column; align-items: flex-start; }
+.book-tile-cover { position: relative; width: 100%; margin-bottom: 10px; }
+.tile-open-button { display: block; width: 100%; padding: 0; border: 0; background: transparent; cursor: pointer; text-align: left; }
+.book-tile .cover { width: 100%; transition: transform .18s ease, box-shadow .18s ease; }
 .book-tile:hover .cover { transform: translateY(-3px); box-shadow: 5px 8px 0 #e8dfce; }
-.book-tile > strong { width: 100%; overflow: hidden; font: .81rem var(--serif); text-overflow: ellipsis; white-space: nowrap; }
+.tile-delete-button { display: grid; position: absolute; z-index: 1; top: 8px; right: 8px; width: 32px; height: 32px; place-items: center; padding: 0; border: 1px solid rgb(222 213 197 / 85%); border-radius: 50%; background: rgb(251 247 238 / 94%); color: #77584c; cursor: pointer; opacity: 0; transition: opacity .15s ease, background .15s ease, color .15s ease; }
+.book-tile:hover .tile-delete-button, .tile-delete-button:focus-visible { opacity: 1; }
+.tile-delete-button:hover { background: #77584c; color: #fffdf7; }
+.tile-delete-button .icon { width: 16px; height: 16px; }
+.tile-title-button { width: 100%; overflow: hidden; padding: 0; border: 0; background: transparent; color: var(--ink); cursor: pointer; font: .81rem var(--serif); text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.tile-title-button:hover { color: var(--blue); }
 .tile-author { width: 100%; margin-top: 3px; overflow: hidden; color: var(--muted); font-size: .65rem; text-overflow: ellipsis; white-space: nowrap; }
 .status-badge { display: inline-flex; align-items: center; width: fit-content; margin-top: 8px; padding: 4px 8px; border-radius: 999px; background: #e8dfce; color: #625c51; font-size: .61rem; font-weight: 700; }
 .status-reading { background: #f4e6c6; color: #725818; }
@@ -159,7 +166,7 @@ h1, h2, h3 { font-family: var(--serif); font-weight: 400; }
 .filter-tabs button.selected { border-color: #d5c499; background: #f6eacb; color: var(--ink); font-weight: 700; }
 .book-count { color: var(--muted); font-size: .72rem; white-space: nowrap; }
 .library-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 22px 18px; }
-.library-grid .book-tile .cover { margin-bottom: 11px; }
+.library-grid .book-tile-cover { margin-bottom: 11px; }
 .add-library-tile { display: flex; min-height: 220px; flex-direction: column; align-items: center; justify-content: center; gap: 9px; border: 1px dashed #d3c9b8; border-radius: 8px; background: rgb(232 223 206 / 28%); color: #716b60; cursor: pointer; }
 .add-library-tile strong { font: .92rem var(--serif); }
 .add-library-tile small { color: #8b8478; font-size: .65rem; text-align: center; }
@@ -397,7 +404,8 @@ h1, h2, h3 { font-family: var(--serif); font-weight: 400; }
   .book-shelf { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 15px 12px; }
   .book-shelf .book-tile:nth-child(n+5) { display: none; }
   .book-shelf .cover { margin-bottom: 8px; }
-  .book-tile > strong { font-size: .76rem; }
+  .tile-delete-button { width: 29px; height: 29px; opacity: 1; }
+  .tile-title-button { font-size: .76rem; }
   .add-shelf-tile { min-height: 0; aspect-ratio: 2 / 2.93; }
   .rhythm-strip { align-items: flex-start; padding: 12px; }
   .rhythm-strip p { font-size: .69rem; }

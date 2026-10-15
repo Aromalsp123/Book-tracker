@@ -39,16 +39,16 @@ const firebaseConfigPath = new URL('../firebase.json', import.meta.url);
 const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
 
 test('manifest has a stable standalone launch configuration', () => {
-  assert.equal(manifest.id, '/');
-  assert.equal(manifest.start_url, '/');
-  assert.equal(manifest.scope, '/');
+  assert.equal(manifest.id, './');
+  assert.equal(manifest.start_url, './');
+  assert.equal(manifest.scope, './');
   assert.equal(manifest.display, 'standalone');
   assert.equal(manifest.background_color, manifest.theme_color);
 });
 
 test('declared app icons exist at their exact dimensions without alpha', async () => {
   for (const icon of manifest.icons) {
-    const file = new URL(`../static${icon.src}`, import.meta.url);
+    const file = new URL(icon.src, manifestPath);
     const png = await readFile(file);
     const [expectedWidth, expectedHeight] = icon.sizes.split('x').map(Number);
 
