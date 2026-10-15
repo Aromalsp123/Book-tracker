@@ -5,7 +5,7 @@ const assetsUrl = new URL('./functions/assets/', import.meta.url);
 const targetUrl = new URL('profile-shell.html', assetsUrl);
 
 const markers = [
-  '<title data-shell-title>MARGIN — A personal reading journal</title>',
+  '<title data-shell-title>',
   'data-shell-description',
   '<meta data-profile-head-slot content="" />',
   '<div id="profile-snapshot-slot"></div>',
