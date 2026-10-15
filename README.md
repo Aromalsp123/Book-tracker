@@ -1,4 +1,4 @@
-# MARGIN — A personal reading journal
+# MARGIN A personal reading journal
 
 [![Visit MARGIN](https://img.shields.io/badge/Visit-MARGIN-cda93e?style=for-the-badge)](https://aromalsp123.github.io/Book-tracker/)
 
