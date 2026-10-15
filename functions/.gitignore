@@ -1,0 +1,15 @@
+# Compiled JavaScript files
+**/*.js
+**/*.js.map
+
+# TypeScript v1 declaration files
+typings/
+
+# Node.js dependency directory
+node_modules/
+
+# Local Secret Manager emulator overrides
+.secret.local
+
+# Build-time copy of ../shared (see package.json sync-shared)
+src/shared/

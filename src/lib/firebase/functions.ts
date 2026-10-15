@@ -1,0 +1,184 @@
+import { connectFunctionsEmulator, getFunctions, httpsCallable } from 'firebase/functions';
+import { app } from './index.ts';
+import type {
+  AdminCatalogApplyRequest,
+  AdminCatalogApplyResponse,
+  AdminReviewRequest,
+  AdminReviewResponse,
+  CatalogAddEditionRequest,
+  CatalogAddEditionResponse,
+  CatalogCreateRequest,
+  CatalogCreateResponse,
+  CatalogSearchRequest,
+  CatalogSearchResponse,
+  EnsureCatalogAuthorsRequest,
+  EnsureCatalogAuthorsResponse,
+  WorkReadersRequest,
+  WorkReadersResponse,
+} from '../interfaces/catalog.ts';
+import {
+  decodeAdminCatalogApplyResponse,
+  decodeAdminReviewResponse,
+} from '../utils/adminCatalog.ts';
+import {
+  decodeCatalogAddEditionResponse,
+  decodeCatalogCreateResponse,
+  decodeCatalogSearchResponse,
+  decodeEnsureCatalogAuthorsResponse,
+  decodeWorkReadersResponse,
+} from '../utils/catalogClient.ts';
+import type { IssueReport } from '../utils/issueReport.ts';
+
+export interface TogglConfigResponse {
+  workspaceId: number;
+  projectId: number;
+}
+
+export interface TogglStartResponse {
+  entryId: number;
+  start: string;
+}
+
+export interface TogglStopResponse {
+  seconds: number;
+  minutes: number;
+}
+
+export interface GoogleVolumeInfo {
+  title?: string;
+  authors?: string[];
+  pageCount?: number;
+  publisher?: string;
+  publishedDate?: string;
+  categories?: string[];
+  imageLinks?: { thumbnail?: string };
+}
+
+export interface AdminUserRow {
+  uid: string;
+  email: string | null;
+  emailVerified: boolean | null;
+  signedUpAt: number | null;
+  lastSignInAt: number | null;
+  lastActiveAt: number | null;
+  anomaly: string | null;
+  books: number;
+  pagesRead: number;
+  timeRead: number;
+  finishedBooks: number;
+  readingSessions: number;
+  lastReadAt: number | null;
+  lastEditAt: number | null;
+}
+
+export interface AdminIssueRow {
+  id: string;
+  at: number;
+  level: 'warn' | 'error';
+  event: string;
+  code: string | null;
+  message: string;
+  uid: string | null;
+  email: string;
+  emailVerified: boolean;
+  malformed: boolean;
+}
+
+export interface AdminOverview {
+  users: AdminUserRow[];
+  issues: AdminIssueRow[];
+  issueWindowDays: number;
+  // Feed caps, enforced per account at query time; cappedAccounts is how
+  // many accounts had more rows in the window than perAccount.
+  issueCaps: {
+    perAccount: number;
+    cappedAccounts: number;
+    // The capped accounts by email ("(deleted user)" when no auth record).
+    cappedAccountEmails: string[];
+    anonymous: number;
+    anonymousCapped: boolean;
+    // Rows shown of the rows that passed the per-account caps.
+    shown: number;
+    total: number;
+    // Accounts (plus the anonymous group) with rows in the window, and how
+    // many of them the 200-row cut left with at least one row shown.
+    groupsWithRows: number;
+    groupsShown: number;
+    // Accounts whose read failed; their rows are missing from this feed.
+    unreadAccounts: number;
+    // Whether the read for rows without a uid failed.
+    anonymousUnread: boolean;
+  };
+}
+
+const fns = getFunctions(app, 'europe-west1');
+
+if (import.meta.env.DEV && import.meta.env.VITE_EMULATOR) {
+  connectFunctionsEmulator(fns, '127.0.0.1', 5001);
+}
+
+export const togglSaveToken = httpsCallable<{ token: string }, TogglConfigResponse>(fns, 'toggl-savetoken');
+export const togglStart = httpsCallable<{ bookId: string }, TogglStartResponse>(fns, 'toggl-start');
+export const togglStop = httpsCallable<{ bookId: string }, TogglStopResponse>(fns, 'toggl-stop');
+export const togglClearStopping = httpsCallable<{ bookId: string }, { cleared: true }>(fns, 'toggl-clearstopping');
+export const togglClearToken = httpsCallable<Record<string, never>, { cleared: true }>(fns, 'toggl-cleartoken');
+export const adminOverview = httpsCallable<Record<string, never>, AdminOverview>(fns, 'admin-overview');
+export const lookupIsbn = httpsCallable<{ isbn: string }, { volume: GoogleVolumeInfo | null }>(fns, 'booksapi-lookupisbn');
+export const reportIssue = httpsCallable<IssueReport, { recorded: true }>(fns, 'telemetry-reportissue');
+
+const catalogSearchCallable = httpsCallable<CatalogSearchRequest, unknown>(fns, 'catalog-search');
+const ensureCatalogAuthorsCallable = httpsCallable<EnsureCatalogAuthorsRequest, unknown>(fns, 'catalog-ensureauthors');
+const workReadersCallable = httpsCallable<WorkReadersRequest, unknown>(fns, 'catalog-workreaders');
+const catalogCreateCallable = httpsCallable<CatalogCreateRequest, unknown>(fns, 'catalog-create');
+const catalogAddEditionCallable = httpsCallable<CatalogAddEditionRequest, unknown>(fns, 'catalog-addedition');
+const adminCatalogApplyCallable = httpsCallable<AdminCatalogApplyRequest, unknown>(fns, 'admin-catalogapply');
+const adminReviewCallable = httpsCallable<AdminReviewRequest, unknown>(fns, 'admin-review');
+
+export async function catalogSearch(request: CatalogSearchRequest): Promise<CatalogSearchResponse> {
+  return decodeCatalogSearchResponse((await catalogSearchCallable(request)).data);
+}
+
+export async function ensureCatalogAuthors(
+  request: EnsureCatalogAuthorsRequest,
+): Promise<EnsureCatalogAuthorsResponse> {
+  return decodeEnsureCatalogAuthorsResponse(
+    (await ensureCatalogAuthorsCallable(request)).data,
+    request.authors.length,
+  );
+}
+
+export async function catalogCreate(request: CatalogCreateRequest): Promise<CatalogCreateResponse> {
+  return decodeCatalogCreateResponse((await catalogCreateCallable(request)).data);
+}
+
+export async function catalogAddEdition(
+  request: CatalogAddEditionRequest,
+): Promise<CatalogAddEditionResponse> {
+  return decodeCatalogAddEditionResponse((await catalogAddEditionCallable(request)).data);
+}
+
+export async function workReaders(request: WorkReadersRequest): Promise<WorkReadersResponse> {
+  return decodeWorkReadersResponse((await workReadersCallable(request)).data);
+}
+
+export async function adminCatalogApply(
+  request: AdminCatalogApplyRequest,
+): Promise<AdminCatalogApplyResponse> {
+  return decodeAdminCatalogApplyResponse((await adminCatalogApplyCallable(request)).data);
+}
+
+export async function adminReview(request: AdminReviewRequest): Promise<AdminReviewResponse> {
+  return decodeAdminReviewResponse((await adminReviewCallable(request)).data);
+}
+
+export const timerInspect = httpsCallable<{token: string}, unknown>(fns, 'timetracking-inspect');
+export const timerConnect = httpsCallable<unknown, unknown>(fns, 'timetracking-connect');
+export const timerContext = httpsCallable<{includeProjects?: boolean} | {warmup: true}, unknown>(fns, 'timetracking-context');
+export const timerAccept = httpsCallable<unknown, unknown>(fns, 'timetracking-accept');
+export const timerRetry = httpsCallable<{operationId: string}, unknown>(fns, 'timetracking-retry');
+export const timerReplace = httpsCallable<unknown, unknown>(fns, 'timetracking-replace');
+export const timerClear = httpsCallable<unknown, unknown>(fns, 'timetracking-clear');
+export const timerAcknowledgeLegacy = httpsCallable<{queueId: string; remoteChecked: true}, unknown>(fns, 'timetracking-acknowledgelegacy');
+
+export const timerAcknowledge = httpsCallable<{operationId: string} & ({remoteChecked: true} | {readingChecked: true}), unknown>(fns, 'timetracking-acknowledge');
+export const timerSweep = httpsCallable<Record<string, never>, {processed:number}>(fns, 'timetracking-sweep');

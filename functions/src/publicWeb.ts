@@ -1,0 +1,926 @@
+import {Buffer} from "node:buffer";
+import {readFileSync} from "node:fs";
+import {join} from "node:path";
+import {gzipSync} from "node:zlib";
+import {clearTimeout, setTimeout} from "node:timers";
+import {logger} from "firebase-functions";
+import {onRequest} from "firebase-functions/v2/https";
+import {getFirestore} from "firebase-admin/firestore";
+import {
+  decodeProfileDiscoveryMarker,
+  decodePublicProfile,
+  type PublicProfile,
+  type PublicProfileLink,
+  type PublicProfileRecords,
+  type PublicProfileStats,
+  type PublicProfileYear,
+  type PublicProfileDay,
+} from "./decoders";
+import {
+  renderNotFoundDocument,
+  renderProfileDocument,
+  renderSitemap,
+} from "./publicProfileRenderer";
+import {PUBLICWEB_RUNTIME_SERVICE_ACCOUNT} from "./runtime";
+import {publicProfileReader} from "./publicProfileRepository";
+
+const USERNAME_PATTERN = /^[a-z0-9-]{3,30}$/;
+const PROFILE_ROUTE = /^\/profiles\/([^/]+)$/;
+const PROFILE_JSON_ROUTE = /^\/profiles\/([^/]+)\.json$/;
+
+// Profiles are public by definition, so both hits and misses may sit on the
+// Cloudflare edge in front of book.ankile.com; cloudflare/worker.ts stamps
+// the same Cache-Control value on /profiles/**. The edge cache is a
+// convenience, not the ceiling: the function's run.app origin is directly
+// reachable and every distinct query string or percent-encoding is a fresh
+// cache key. The response cache below is what
+// bounds the origin's work (SEC-019, SEC-020): a repeat path costs nothing
+// for RESPONSE_CACHE_TTL_MS, and a flood of *distinct* paths — the key
+// space is attacker-chosen — is capped by the per-instance miss budget,
+// after which the origin answers 503 without touching Firestore. 200s and
+// 404s live in separately bounded pools, so the flood's 404s cannot evict
+// real profiles, and while the budget is exhausted a memoised profile is
+// served stale for up to RESPONSE_CACHE_STALE_MS instead of failing. Privacy lag for a profile
+// flipped private composes across tiers: up to 60 s here (300 s while the
+// origin is being flooded) + 300 s shared CDN + 60 s browser, with no
+// purge path (SEC-031).
+const PROFILE_CACHE_CONTROL = "public, max-age=60, s-maxage=300";
+const SITEMAP_CACHE_CONTROL = "public, max-age=300, s-maxage=300";
+const RESPONSE_CACHE_TTL_MS = 60_000;
+const RESPONSE_CACHE_STALE_MS = 300_000;
+// Bounds cached bodies, not just entries. Size from what firestore.rules
+// lets a stranger store, not from today's data: a profile at the rules
+// ceiling (days ≤ 4000, years ≤ 200, numbers unbounded) serialises to
+// ~520 KB on the JSON route and ~275 KB as HTML (measured), plus a gzip
+// copy of each (~11 %), so the retained pool is up to ~57 MB, and the
+// transient pool holds 404s —
+// ~22 bytes for JSON, ~6.5 KB rendered — at most ~7 MB more. In-flight
+// requests hold raw + decoded + rendered copies (~1.4 MB each at the
+// ceiling), which is why the handler caps concurrency below the gen-2
+// default of 80. All against the 256 MiB default.
+const RESPONSE_CACHE_MAX_ENTRIES = 100;
+const RESPONSE_CACHE_MAX_TRANSIENT_ENTRIES = 1000;
+// Uncached profile responses each cost one Firestore read (unknown or
+// private name) or two (public profile: document + marker) plus a decode
+// and render. 300 per minute per instance (2 instances) is far above real
+// traffic and caps a rotating-name flood at 864k misses/day — up to 1.7M
+// reads (≈ $1/day) when the names are attacker-owned public profiles.
+// The sitemap is bounded separately below. None of this meters CDN hits:
+// a cached 93 KB JSON hit costs egress only, which no cap here bounds.
+const MISS_BUDGET_PER_WINDOW = 300;
+const MISS_BUDGET_WINDOW_MS = 60_000;
+// The sitemap is the one request whose cost scales with data strangers can
+// create (SEC-032): one miss, but a profile read per discovery marker. The
+// scan is capped, oldest markers first — rules pin a marker's createdAt to
+// the server clock, so a seeded collection can only append after the
+// profiles that were there before it, never displace them; reads run in
+// small batches so at most a batch of ~0.7 MB documents is in memory at
+// once; the scan gives up after SITEMAP_SCAN_BUDGET_MS and serves what it
+// has rather than time out — a cut-short sitemap never replaces a
+// fresh complete one and on its own is held for five minutes, not the
+// hour, so the degraded worst case is ≈ 288 scans/day/instance. A scan
+// that *fails* — a Firestore fault, or the marker list itself not
+// answering by SITEMAP_SCAN_DEADLINE_MS — resolves as a 503 that is
+// memoised the same degraded way (SEC-090): every key costs one miss no
+// matter what its load cost, so a failure that was never memoised was
+// retried as a full scan on every request, ≈ 300 scans per budget window
+// instead of one per five minutes. An empty cut-short scan is refused the
+// same way rather than published as an empty sitemap. The deadline is
+// cooperative: a scan that runs out of time keeps the batches it has and
+// answers partial, like the budget; only a marker list that never answers
+// is abandoned outright. Trade accepted: once the pinned complete sitemap
+// is past its hour, a failing scan replaces it with the refusal for five
+// minutes rather than serving the hour-old list (which could name a
+// profile since made private); and the
+// finished sitemap is pinned in its
+// own memo slot for SITEMAP_MEMO_TTL_MS so attacker-owned profiles cannot
+// evict it and force a rescan. The uptime check fetches the sitemap
+// every 15 minutes through the CDN, so the memo TTL — not the check — sets
+// the floor: one scan per instance per hour; a scan is up to 1000 marker
+// reads + 1000 profile reads, so ≤ ~96k reads/day across both instances
+// at the cap (≈ 1.15M if every scan is cut short — see pinnedDegradedTtlMs). A sitemap can therefore lag a privacy change by
+// up to an hour (+ stale allowance + CDN); profiles pages do not. Past the
+// cap the sitemap is deterministically truncated (oldest markers win);
+// past the time budget it is marked partial. Both say so in the log.
+export const SITEMAP_MAX_PROFILES = 1_000;
+export const SITEMAP_READ_CONCURRENCY = 25;
+export const SITEMAP_SCAN_BUDGET_MS = 20_000;
+// Hard ceiling on the whole scan, inside the 30 s function timeout so the
+// failure is this code's deterministic 503, not the platform's.
+export const SITEMAP_SCAN_DEADLINE_MS = 25_000;
+const SITEMAP_MEMO_TTL_MS = 3_600_000;
+const SITEMAP_PARTIAL_MEMO_TTL_MS = 300_000;
+
+interface StoredDocument {
+  id: string;
+  value: unknown;
+}
+
+export interface PublicWebRepository {
+  getProfile(_username: string, _signal?: AbortSignal): Promise<unknown | null>;
+  getDiscovery(_username: string, _signal?: AbortSignal): Promise<unknown | null>;
+  listDiscoveries(_limit: number): Promise<StoredDocument[]>;
+}
+
+export interface PublicWebRequest {
+  method: string;
+  path: string;
+  // Whether the caller advertised gzip; the memo key is the path alone, so
+  // both encodings share one entry and one Firestore load.
+  acceptsGzip?: boolean;
+}
+
+export interface PublicWebResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: string;
+  // A 200 that does not carry everything it should (a sitemap cut short by
+  // its time budget). Never retained; for the pinned sitemap key it is a
+  // degraded value — see TtlCacheOptions.pinnedDegradedTtlMs.
+  partial?: boolean;
+  // gzip of body, computed once when the response is memoised (bodies of
+  // at least GZIP_MIN_BYTES). A profile JSON is ~93 KB raw, ~10 KB gzipped;
+  // Hosting compresses static files but not function responses.
+  gzipped?: Buffer;
+}
+
+const GZIP_MIN_BYTES = 1024;
+
+// Whether an Accept-Encoding header admits gzip. Honours q-values
+// (`gzip;q=0` refuses it — RFC 9110 §12.5.3) and the `*` wildcard; a
+// bare substring match served gzip to callers that had refused it
+// (SEC-091).
+export function acceptsGzip(acceptEncoding: string | undefined): boolean {
+  if (acceptEncoding === undefined) return false;
+  // A coding named more than once takes its lowest weight, so the answer
+  // does not depend on the order a proxy appended its own member in.
+  let gzip: number | null = null;
+  let wildcard: number | null = null;
+  for (const member of acceptEncoding.split(",")) {
+    const [rawCoding, ...params] = member.split(";");
+    const coding = rawCoding.trim().toLowerCase();
+    if (coding !== "gzip" && coding !== "x-gzip" && coding !== "*") continue;
+    let weight = 1;
+    for (const param of params) {
+      const [name, value] = param.split("=");
+      if (name.trim().toLowerCase() === "q" && value !== undefined) weight = Number(value.trim());
+    }
+    if (!Number.isFinite(weight) || weight < 0) weight = 0;
+    if (coding === "*") wildcard = wildcard === null ? weight : Math.min(wildcard, weight);
+    else gzip = gzip === null ? weight : Math.min(gzip, weight);
+  }
+  if (gzip !== null) return gzip > 0;
+  return wildcard !== null && wildcard > 0;
+}
+
+function withGzip(response: PublicWebResponse): PublicWebResponse {
+  if (Buffer.byteLength(response.body) < GZIP_MIN_BYTES) return response;
+  return {...response, gzipped: gzipSync(response.body)};
+}
+
+export interface EncodedResponse {
+  status: number;
+  headers: Record<string, string>;
+  payload: string | Buffer;
+}
+
+// Chooses the representation for one caller: compressed when advertised and
+// available, always with Vary so shared caches keep both. HEAD carries no
+// payload either way.
+// SEC-007: every publicweb response carries the browser-hardening headers,
+// including error and JSON shapes, and including callers that hit the
+// run.app origin directly, where the Pages worker's header policy
+// (cloudflare/worker.ts) does not apply. The CSP here only pins framing; the full policy travels as a
+// <meta> tag inside the profile shell (built by sync-profile-shell.ts from
+// public/index.html, where SvelteKit injects it with the script hashes).
+const SECURITY_HEADERS: Record<string, string> = {
+  "Content-Security-Policy": "frame-ancestors 'none'",
+  "X-Frame-Options": "DENY",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+};
+
+export function encodeResponse(request: PublicWebRequest, response: PublicWebResponse): EncodedResponse {
+  const headers = {...SECURITY_HEADERS, ...response.headers};
+  if (response.gzipped !== undefined) headers["Vary"] = "Accept-Encoding";
+  if (request.method === "HEAD") return {status: response.status, headers, payload: ""};
+  if (request.acceptsGzip === true && response.gzipped !== undefined) {
+    headers["Content-Encoding"] = "gzip";
+    return {status: response.status, headers, payload: response.gzipped};
+  }
+  return {status: response.status, headers, payload: response.body};
+}
+
+// The wire shape of /profiles/<username>.json, consumed by the SPA route.
+// Deliberately narrower than the stored document: `uid` is the owner's
+// Firebase identity and has no business on a public endpoint, and `public`
+// is implied — private profiles are not served here at all.
+export interface PublicProfileView {
+  username: string;
+  givenName: string;
+  familyName: string;
+  links: PublicProfileLink[];
+  stats: PublicProfileStats;
+  records: PublicProfileRecords | null;
+  years: PublicProfileYear[];
+  days: PublicProfileDay[];
+  updatedAt: string;
+}
+
+export function publicProfileView(profile: PublicProfile): PublicProfileView {
+  return {
+    username: profile.username,
+    givenName: profile.givenName,
+    familyName: profile.familyName,
+    links: profile.links,
+    stats: profile.stats,
+    records: profile.records,
+    years: profile.years,
+    days: profile.days,
+    updatedAt: profile.updatedAt.toDate().toISOString(),
+  };
+}
+
+export interface TtlCacheOptions<T> {
+  ttlMs: number;
+  // Lifetime of a retained entry past which it is dropped even for stale
+  // service; must exceed ttlMs.
+  staleTtlMs: number;
+  maxEntries: number;
+  maxTransientEntries: number;
+  maxMissesPerWindow: number;
+  windowMs: number;
+  // Which loaded values are retained (memoised for staleTtlMs, counted
+  // against maxEntries); the rest are transient — memoised for ttlMs only,
+  // in their own pool bounded by maxTransientEntries. Defaults to retaining
+  // everything.
+  retain?: (_value: T) => boolean;
+  // Keys whose retained values live outside the LRU, uncapped and fresh for
+  // pinnedTtlMs (default ttlMs), with the same stale allowance past that as
+  // ordinary retained entries. For the few expensive, well-known keys that
+  // a flood of cheap 200s must not be able to evict. Defaults to none.
+  pin?: (_key: string) => boolean;
+  pinnedTtlMs?: number;
+  // A pinned key whose load is not retained (a degraded value, such as a
+  // sitemap cut short by its time budget) never displaces a fresh retained
+  // value; on its own it is held for pinnedDegradedTtlMs (default ttlMs)
+  // so a run of degraded loads costs one reload per that interval, not one
+  // per request.
+  pinnedDegradedTtlMs?: number;
+  now?: () => number;
+  loadTimeoutMs?: (_key: string) => number | undefined;
+  failureCooldownMs?: number;
+  maxInflight?: number;
+  observe?: (_event: {outcome: string; loadId?: number; durationMs?: number}) => void;
+}
+
+class PublicWebUnavailable extends Error {
+  constructor() {
+    super("Public profile dependency unavailable");
+  }
+}
+
+function retryableReadError(error: unknown): boolean {
+  return error instanceof PublicWebUnavailable ||
+    (typeof error === "object" && error !== null && "code" in error &&
+      [4, 8, 13, 14].includes(error.code as number));
+}
+
+export const MISS_BUDGET_EXHAUSTED = Symbol("publicweb miss budget exhausted");
+
+export interface TtlCache<T> {
+  get(_key: string, _load: (_signal: AbortSignal) => Promise<T>): Promise<T> | typeof MISS_BUDGET_EXHAUSTED;
+}
+
+interface CacheEntry<T> {
+  loadedAt: number;
+  value: T;
+  degraded?: boolean;
+}
+
+// Per-instance memo. An entry is fresh for ttlMs; a hit refreshes recency
+// and the least recently used key of the same pool is evicted past that
+// pool's cap. Concurrent callers for one key share the in-flight promise,
+// and a load only enters a response pool once it resolves. Failed loads
+// have a separate bounded cooldown pool; unfinished work retains its
+// in-flight slot even after the response deadline. Loads are metered: once
+// maxMissesPerWindow uncached loads have started in the current window the
+// cache stops loading and reports MISS_BUDGET_EXHAUSTED, which is the
+// ceiling on what a flood of distinct keys can cost this instance — unless
+// the key has a retained entry younger than staleTtlMs, which is served
+// stale rather than refused. A key that reloads as transient drops its
+// retained entry, so a value the cache has seen replaced is never revived.
+export function createTtlCache<T>(options: TtlCacheOptions<T>): TtlCache<T> {
+  if (options.staleTtlMs <= options.ttlMs) throw new Error("staleTtlMs must exceed ttlMs");
+  const now = options.now ?? Date.now;
+  const retain = options.retain ?? (() => true);
+  const pin = options.pin ?? (() => false);
+  const pinnedTtlMs = options.pinnedTtlMs ?? options.ttlMs;
+  const pinnedDegradedTtlMs = options.pinnedDegradedTtlMs ?? options.ttlMs;
+  const pinnedFreshMs = (entry: CacheEntry<T>): number =>
+    entry.degraded === true ? pinnedDegradedTtlMs : pinnedTtlMs;
+  const staleAllowanceMs = options.staleTtlMs - options.ttlMs;
+  const retained = new Map<string, CacheEntry<T>>();
+  const pinned = new Map<string, CacheEntry<T>>();
+  const transient = new Map<string, CacheEntry<T>>();
+  const inflight = new Map<string, {promise: Promise<T>; loadId: number}>();
+  const failures = new Map<string, number>();
+  let nextLoadId = 0;
+  const observe = (event: Parameters<NonNullable<TtlCacheOptions<T>["observe"]>>[0]): void => {
+    try {
+      options.observe?.(event);
+    } catch {
+      // Diagnostics must not interrupt settlement or leave an in-flight slot occupied.
+    }
+  };
+  let windowStart = now();
+  let misses = 0;
+
+  const touch = (pool: Map<string, CacheEntry<T>>, key: string, entry: CacheEntry<T>): Promise<T> => {
+    pool.delete(key);
+    pool.set(key, entry);
+    return Promise.resolve(entry.value);
+  };
+  const insert = (pool: Map<string, CacheEntry<T>>, cap: number, key: string, entry: CacheEntry<T>): void => {
+    pool.delete(key);
+    pool.set(key, entry);
+    for (const oldest of pool.keys()) {
+      if (pool.size <= cap) break;
+      pool.delete(oldest);
+    }
+  };
+
+  return {
+    get(key, load) {
+      const at = now();
+      const held = pinned.get(key);
+      if (held !== undefined && held.loadedAt + pinnedFreshMs(held) > at) {
+        observe({outcome: "fresh"});
+        return Promise.resolve(held.value);
+      }
+      const kept = retained.get(key);
+      if (kept !== undefined && kept.loadedAt + options.ttlMs > at) {
+        observe({outcome: "fresh"});
+        return touch(retained, key, kept);
+      }
+      const passing = transient.get(key);
+      if (passing !== undefined && passing.loadedAt + options.ttlMs > at) {
+        observe({outcome: "transient"});
+        return touch(transient, key, passing);
+      }
+      const pending = inflight.get(key);
+      if (pending !== undefined) {
+        observe({outcome: "shared", loadId: pending.loadId});
+        return pending.promise;
+      }
+      const retryAt = failures.get(key);
+      if (retryAt !== undefined) {
+        if (at < retryAt) {
+          observe({outcome: "cooldown"});
+          return Promise.reject(new PublicWebUnavailable());
+        }
+        failures.delete(key);
+      }
+      if (inflight.size >= (options.maxInflight ?? Infinity)) {
+        observe({outcome: "capacity"});
+        return MISS_BUDGET_EXHAUSTED;
+      }
+      if (at - windowStart >= options.windowMs) {
+        windowStart = at;
+        misses = 0;
+      }
+      if (misses >= options.maxMissesPerWindow) {
+        observe({outcome: "miss-budget"});
+        if (held !== undefined && held.loadedAt + pinnedFreshMs(held) + staleAllowanceMs > at) {
+          return Promise.resolve(held.value);
+        }
+        if (kept !== undefined && kept.loadedAt + options.staleTtlMs > at) return touch(retained, key, kept);
+        return MISS_BUDGET_EXHAUSTED;
+      }
+      misses += 1;
+      const loadId = ++nextLoadId;
+      const controller = new AbortController();
+      const cooldown = (): void => {
+        if (options.failureCooldownMs === undefined) return;
+        failures.delete(key);
+        failures.set(key, now() + options.failureCooldownMs);
+        for (const oldest of failures.keys()) {
+          if (failures.size <= options.maxTransientEntries) break;
+          failures.delete(oldest);
+        }
+      };
+      let expired = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let resolve!: (_loaded: T) => void;
+      let reject!: (_error: unknown) => void;
+      const value = new Promise<T>((res, rej) => {resolve = res; reject = rej;});
+      inflight.set(key, {promise: value, loadId});
+      const timeoutMs = options.loadTimeoutMs?.(key);
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          expired = true;
+          controller.abort();
+          cooldown();
+          observe({outcome: "deadline", loadId, durationMs: now() - at});
+          reject(new PublicWebUnavailable());
+        }, timeoutMs);
+      }
+      observe({outcome: "load", loadId});
+      // The response deadline does not release ownership of the actual work.
+      // Late results are discarded; new keys are bounded by maxInflight.
+      const finish = (): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        inflight.delete(key);
+        if (expired) observe({outcome: "late-settlement", loadId, durationMs: now() - at});
+      };
+      Promise.resolve().then(() => {
+        controller.signal.throwIfAborted();
+        return load(controller.signal);
+      }).then((loaded) => {
+        if (expired) return loaded;
+        const entry = {loadedAt: at, value: loaded};
+        if (retain(loaded)) {
+          transient.delete(key);
+          if (pin(key)) pinned.set(key, entry);
+          else insert(retained, options.maxEntries, key, entry);
+        } else if (pin(key)) {
+          const current = pinned.get(key);
+          if (current === undefined || current.degraded === true || current.loadedAt + pinnedTtlMs <= at) {
+            pinned.set(key, {...entry, degraded: true});
+          }
+        } else {
+          retained.delete(key);
+          insert(transient, options.maxTransientEntries, key, entry);
+        }
+        observe({outcome: "loaded", loadId, durationMs: now() - at});
+        return loaded;
+      }).then((loaded) => {
+        finish();
+        if (!expired) resolve(loaded);
+      }, (error: unknown) => {
+        finish();
+        if (!expired) {
+          if (retryableReadError(error)) cooldown();
+          observe({outcome: retryableReadError(error) ? "unavailable" : "error", loadId,
+            durationMs: now() - at});
+          reject(error);
+        }
+      });
+      return value;
+    },
+  };
+}
+
+export const firestoreRepository: PublicWebRepository = {
+  ...publicProfileReader,
+  async listDiscoveries(limit) {
+    const snapshot = await getFirestore().collection("profileDiscovery")
+      .orderBy("createdAt").limit(limit).get();
+    return snapshot.docs.map((document) => ({
+      id: document.id,
+      value: document.data(),
+    }));
+  },
+};
+
+function htmlHeaders(cacheControl: string): Record<string, string> {
+  return {
+    "Cache-Control": cacheControl,
+    "Content-Type": "text/html; charset=utf-8",
+  };
+}
+
+// The JSON projection is for the SPA, never for crawlers: the HTML page
+// carries the owner's search opt-in as a robots meta tag, and the JSON
+// twin (which holds strictly more data) must not be indexable regardless.
+function jsonHeaders(): Record<string, string> {
+  return {
+    "Cache-Control": PROFILE_CACHE_CONTROL,
+    "Content-Type": "application/json; charset=utf-8",
+    "X-Robots-Tag": "noindex",
+  };
+}
+
+// Public means opted in AND not tombstoned: account deletion keeps the
+// profile document and stamps deletedAt (SEC-006), and that document must
+// be as invisible to strangers as a missing one — the same 404, and no
+// sitemap row (checked before decoding, so a tombstone is never logged as
+// a malformed skip).
+function profileIsPublic(value: unknown): boolean {
+  return typeof value === "object" && value !== null &&
+    !Array.isArray(value) && "public" in value && value.public === true &&
+    !("deletedAt" in value);
+}
+
+interface SitemapEntry {
+  username: string;
+  updatedAt: Date;
+}
+
+// One malformed discovery marker or profile document must cost only its own
+// sitemap row, not the whole sitemap: rules bound the shapes but do not
+// validate every nested value (SEC-009), and the sitemap is the one place
+// a single bad document is rendered alongside everyone else's. Firestore
+// read failures still propagate — those are infrastructure, not data.
+interface SitemapSkip {
+  username: string;
+  reason: string;
+}
+
+function sitemapEntry(
+  document: StoredDocument,
+  storedProfile: unknown | null,
+  skipped: SitemapSkip[],
+): SitemapEntry | null {
+  if (storedProfile === null || !profileIsPublic(storedProfile)) return null;
+  let markerUid: string;
+  let profile: PublicProfile;
+  try {
+    markerUid = decodeProfileDiscoveryMarker(document.value).uid;
+    profile = decodePublicProfile(document.id, storedProfile);
+  } catch (error) {
+    skipped.push({
+      username: document.id,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+  if (profile.uid !== markerUid) return null;
+  return {username: document.id, updatedAt: profile.updatedAt.toDate()};
+}
+
+interface SitemapScan {
+  entries: SitemapEntry[];
+  complete: boolean;
+}
+
+class ScanDeadlineExceeded extends Error {
+  constructor() {
+    super(`sitemap scan exceeded ${SITEMAP_SCAN_DEADLINE_MS} ms`);
+  }
+}
+
+// One timer per scan. `race` bounds a single await; `expired` lets the
+// batch loop stop issuing reads once it has fired. The timer never keeps
+// the process alive and is cleared when the scan settles.
+class ScanDeadline {
+  expired = false;
+  private readonly rejection: Promise<never>;
+  private readonly timer: ReturnType<typeof setTimeout>;
+
+  constructor(ms: number) {
+    let expire: () => void = () => undefined;
+    this.rejection = new Promise<never>((_resolve, reject) => {
+      expire = () => {
+        this.expired = true;
+        reject(new ScanDeadlineExceeded());
+      };
+    });
+    // Rejections are observed through race(); this keeps an expiry that
+    // fires between awaits from surfacing as an unhandled rejection.
+    this.rejection.catch(() => undefined);
+    this.timer = setTimeout(expire, ms);
+    this.timer.unref();
+  }
+
+  race<T>(pending: Promise<T>): Promise<T> {
+    return Promise.race([pending, this.rejection]);
+  }
+
+  clear(): void {
+    clearTimeout(this.timer);
+  }
+}
+
+async function sitemapProfiles(repository: PublicWebRepository): Promise<SitemapScan> {
+  const deadline = new ScanDeadline(SITEMAP_SCAN_DEADLINE_MS);
+  return scanSitemapProfiles(repository, deadline).finally(() => deadline.clear());
+}
+
+async function scanSitemapProfiles(
+  repository: PublicWebRepository,
+  deadline: ScanDeadline,
+): Promise<SitemapScan> {
+  const startedAt = Date.now();
+  // Nothing to salvage if the marker list itself never answers.
+  const discoveries = await deadline.race(repository.listDiscoveries(SITEMAP_MAX_PROFILES));
+  if (discoveries.length >= SITEMAP_MAX_PROFILES) {
+    logger.warn("publicweb.sitemap.truncated", {limit: SITEMAP_MAX_PROFILES});
+  }
+  const entries: SitemapEntry[] = [];
+  let complete = true;
+  // Skips are attacker-seedable data, so they are reported once per scan,
+  // not once per document.
+  const skipped: SitemapSkip[] = [];
+  for (let start = 0; start < discoveries.length; start += SITEMAP_READ_CONCURRENCY) {
+    if (deadline.expired || Date.now() - startedAt > SITEMAP_SCAN_BUDGET_MS) {
+      logger.warn("publicweb.sitemap.truncated", {
+        budgetMs: SITEMAP_SCAN_BUDGET_MS, scanned: start, of: discoveries.length,
+      });
+      complete = false;
+      break;
+    }
+    const batch = discoveries.slice(start, start + SITEMAP_READ_CONCURRENCY);
+    const reads = Promise.all(batch.map(async (document) => {
+      if (!USERNAME_PATTERN.test(document.id)) {
+        skipped.push({username: document.id, reason: "invalid profile discovery id"});
+        return null;
+      }
+      return sitemapEntry(document, await repository.getProfile(document.id), skipped);
+    }));
+    // A batch still in flight at the deadline is the only work given up:
+    // the entries already read are kept and the scan answers partial.
+    const resolved = await deadline.race(reads).catch((error: unknown) => {
+      if (error instanceof ScanDeadlineExceeded) return null;
+      throw error;
+    });
+    if (resolved === null) {
+      logger.warn("publicweb.sitemap.truncated", {
+        deadlineMs: SITEMAP_SCAN_DEADLINE_MS, scanned: start, of: discoveries.length,
+      });
+      complete = false;
+      break;
+    }
+    for (const entry of resolved) if (entry !== null) entries.push(entry);
+  }
+  if (skipped.length > 0) {
+    logger.warn("publicweb.sitemap.skip", {skipped: skipped.length, sample: skipped.slice(0, 5)});
+  }
+  return {entries, complete};
+}
+
+// The marker is the owner's own document too (rules pin its shape, so a
+// malformed one is not reachable today); a profile whose marker fails to
+// decode is simply not searchable, never a throw.
+function decodeMarkerUid(username: string, stored: unknown): string | null {
+  try {
+    return decodeProfileDiscoveryMarker(stored).uid;
+  } catch (error) {
+    logger.warn("publicweb.marker.skip", {
+      username,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+// A public profile that fails to decode is the owner's own malformed data
+// (rules bound shapes, not every nested value — SEC-009/SEC-032). It must
+// be an ordinary, memoised 404, not a 500: a rejected load is metered but
+// never memoised, so a throwing profile would let one repeated URL spend
+// the whole miss budget with no key rotation at all.
+function decodeStoredProfile(username: string, stored: unknown): PublicProfile | null {
+  try {
+    return decodePublicProfile(username, stored);
+  } catch (error) {
+    logger.warn("publicweb.profile.skip", {
+      username,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+// Profile first, discovery marker only for a public profile: an unknown
+// name — the common case under a flood — costs one read, not two.
+async function profileResponse(
+  request: PublicWebRequest,
+  repository: PublicWebRepository,
+  shell: string,
+  username: string,
+  signal?: AbortSignal,
+): Promise<PublicWebResponse> {
+  const storedProfile = await repository.getProfile(username, signal);
+  signal?.throwIfAborted();
+  const profile = storedProfile === null || !profileIsPublic(storedProfile)
+    ? null
+    : decodeStoredProfile(username, storedProfile);
+  if (profile === null) {
+    return {
+      status: 404,
+      headers: htmlHeaders(PROFILE_CACHE_CONTROL),
+      body: request.method === "HEAD" ? "" : renderNotFoundDocument(shell),
+    };
+  }
+
+  const storedDiscovery = await repository.getDiscovery(username, signal);
+  signal?.throwIfAborted();
+  const searchable = storedDiscovery === null
+    ? false
+    : decodeMarkerUid(username, storedDiscovery) === profile.uid;
+  return {
+    status: 200,
+    headers: htmlHeaders(PROFILE_CACHE_CONTROL),
+    body: request.method === "HEAD" ? "" :
+      renderProfileDocument(shell, profile, searchable, publicProfileView(profile)),
+  };
+}
+
+// The SPA's data source for public profiles. Same visibility rule and the
+// same cache headers as the HTML page; a missing, private, or malformed
+// username is one indistinguishable 404 so username existence never leaks.
+async function profileJsonResponse(
+  request: PublicWebRequest,
+  repository: PublicWebRepository,
+  username: string | null,
+  signal?: AbortSignal,
+): Promise<PublicWebResponse> {
+  const storedProfile = username === null ? null : await repository.getProfile(username, signal);
+  signal?.throwIfAborted();
+  const profile = username === null || storedProfile === null || !profileIsPublic(storedProfile)
+    ? null
+    : decodeStoredProfile(username, storedProfile);
+  if (profile === null) {
+    return {
+      status: 404,
+      headers: jsonHeaders(),
+      body: request.method === "HEAD" ? "" : JSON.stringify({error: "not-found"}),
+    };
+  }
+  return {
+    status: 200,
+    headers: jsonHeaders(),
+    body: request.method === "HEAD" ? "" : JSON.stringify(publicProfileView(profile)),
+  };
+}
+
+function sitemapUnavailable(): PublicWebResponse {
+  return {
+    status: 503,
+    headers: {
+      "Cache-Control": "no-store",
+      "Retry-After": "300",
+      "Content-Type": "text/plain; charset=utf-8",
+    },
+    body: "Sitemap temporarily unavailable.\n",
+  };
+}
+
+async function sitemapResponse(repository: PublicWebRepository): Promise<PublicWebResponse> {
+  const scan = await sitemapProfiles(repository);
+  if (!scan.complete && scan.entries.length === 0) {
+    logger.error("publicweb.sitemap.failed", {message: "scan cut short before its first batch"});
+    return sitemapUnavailable();
+  }
+  return {
+    status: 200,
+    headers: {
+      "Cache-Control": SITEMAP_CACHE_CONTROL,
+      "Content-Type": "application/xml; charset=utf-8",
+    },
+    body: renderSitemap(scan.entries),
+    ...(scan.complete ? {} : {partial: true}),
+  };
+}
+
+export async function resolvePublicWebRequest(
+  request: PublicWebRequest,
+  repository: PublicWebRepository,
+  shell: string,
+  signal?: AbortSignal,
+): Promise<PublicWebResponse> {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return {
+      status: 405,
+      headers: {
+        Allow: "GET, HEAD",
+        "Cache-Control": "no-store",
+        "Content-Type": "text/plain; charset=utf-8",
+      },
+      body: "Method not allowed.\n",
+    };
+  }
+
+  if (request.path === "/sitemap.xml") {
+    // A failed or empty scan must resolve, not reject: the response cache
+    // memoises only settled values, and a sitemap miss is the one load
+    // whose cost is not one read (SEC-090). The render is inside the same
+    // region so nothing between the scan and the memo can reject.
+    return sitemapResponse(repository).catch((error: unknown) => {
+      logger.error("publicweb.sitemap.failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return sitemapUnavailable();
+    });
+  }
+
+  const jsonMatch = PROFILE_JSON_ROUTE.exec(request.path);
+  if (jsonMatch !== null) {
+    const username = USERNAME_PATTERN.test(jsonMatch[1]) ? jsonMatch[1] : null;
+    return profileJsonResponse(request, repository, username, signal);
+  }
+
+  const match = PROFILE_ROUTE.exec(request.path);
+  if (match === null || !USERNAME_PATTERN.test(match[1])) {
+    return {
+      status: 404,
+      headers: htmlHeaders(PROFILE_CACHE_CONTROL),
+      body: request.method === "HEAD" ? "" : renderNotFoundDocument(shell),
+    };
+  }
+  return profileResponse(request, repository, shell, match[1], signal);
+}
+
+// Finished responses are what get cached: decode, render, and serialise
+// once per path per TTL. HEAD shares GET's entry and drops the body; 405s
+// cost no reads and bypass the cache. Retryable dependency failures become
+// uncached 503s with a cooldown; unexpected failures propagate. Malformed
+// stored data is a memoised 404 in the transient pool, so a repeated unknown
+// path is free but a flood of them cannot evict profiles.
+export async function cachedPublicWebResponse(
+  request: PublicWebRequest,
+  repository: PublicWebRepository,
+  shell: string,
+  cache: TtlCache<PublicWebResponse>,
+): Promise<PublicWebResponse> {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return resolvePublicWebRequest(request, repository, shell);
+  }
+  const cached = cache.get(
+    request.path,
+    (signal) => resolvePublicWebRequest({method: "GET", path: request.path}, repository, shell, signal).then(withGzip),
+  );
+  if (cached === MISS_BUDGET_EXHAUSTED) {
+    return {
+      status: 503,
+      headers: {
+        "Cache-Control": "no-store",
+        "Retry-After": "60",
+        "Content-Type": "text/plain; charset=utf-8",
+      },
+      body: request.method === "HEAD" ? "" : "Temporarily unavailable.\n",
+    };
+  }
+  const response = await cached.catch((error: unknown): PublicWebResponse => {
+    if (!retryableReadError(error)) throw error;
+    return {
+      status: 503,
+      headers: {"Cache-Control": "no-store", "Retry-After": "10", "Content-Type": "text/plain; charset=utf-8"},
+      body: "Temporarily unavailable.\n",
+    };
+  });
+  return request.method === "HEAD" ? {...response, body: ""} : response;
+}
+
+let cachedShell: string | null = null;
+
+function profileShell(): string {
+  cachedShell ??= readFileSync(join(__dirname, "../assets/profile-shell.html"), "utf8");
+  return cachedShell;
+}
+
+export const RESPONSE_CACHE_OPTIONS: TtlCacheOptions<PublicWebResponse> = {
+  ttlMs: RESPONSE_CACHE_TTL_MS,
+  staleTtlMs: RESPONSE_CACHE_STALE_MS,
+  retain: (response) => response.status === 200 && response.partial !== true,
+  maxEntries: RESPONSE_CACHE_MAX_ENTRIES,
+  maxTransientEntries: RESPONSE_CACHE_MAX_TRANSIENT_ENTRIES,
+  maxMissesPerWindow: MISS_BUDGET_PER_WINDOW,
+  windowMs: MISS_BUDGET_WINDOW_MS,
+  pin: (path) => path === "/sitemap.xml",
+  pinnedTtlMs: SITEMAP_MEMO_TTL_MS,
+  pinnedDegradedTtlMs: SITEMAP_PARTIAL_MEMO_TTL_MS,
+  loadTimeoutMs: (path) => path === "/sitemap.xml" ? undefined : 8_000,
+  failureCooldownMs: 10_000,
+  maxInflight: 16,
+  observe: (event) => logger.info("publicweb.cache", event),
+};
+
+const responseCache = createTtlCache<PublicWebResponse>(RESPONSE_CACHE_OPTIONS);
+
+// maxInstances bounds what a crawler or request flood can cost in
+// invocations, and concurrency bounds what in-flight requests can hold in
+// memory: sixteen ceiling-sized profiles in flight is ~22 MB, eighty (the
+// gen-2 default) would exceed the 256 MiB instance together with the
+// caches. Two instances × 16 is still far above real traffic because
+// repeats are memo hits. Firestore reads and render work are bounded
+// separately by the per-instance response cache and its miss budget. Raise
+// deliberately if legitimate traffic ever queues — the trade is
+// availability under a flood, not correctness.
+export const publicweb = onRequest(
+  {
+    region: "europe-west1",
+    timeoutSeconds: 30,
+    maxInstances: 2,
+    concurrency: 16,
+    serviceAccount: PUBLICWEB_RUNTIME_SERVICE_ACCOUNT,
+  },
+  async (request, response) => {
+    const web = {
+      method: request.method,
+      path: request.path,
+      acceptsGzip: acceptsGzip(request.header("accept-encoding")),
+    };
+    const encoded = encodeResponse(web, await cachedPublicWebResponse(
+      web,
+      firestoreRepository,
+      profileShell(),
+      responseCache,
+    ));
+    response.status(encoded.status);
+    for (const [name, value] of Object.entries(encoded.headers)) {
+      response.set(name, value);
+    }
+    response.send(encoded.payload);
+  },
+);

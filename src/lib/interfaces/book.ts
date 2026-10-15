@@ -1,0 +1,103 @@
+import type {TimerV2} from '../../../shared/timeTracking.ts';
+import type { DocumentReference, Timestamp } from 'firebase/firestore';
+import type { LegacyEmbeddedAuthor } from './author.ts';
+import type { CatalogLink } from './catalog.ts';
+import type { BookMetadata } from './metadata.ts';
+
+// A normalized users/{uid}/books doc returned by the Firestore decoder.
+// Legacy stored shapes are repaired at that boundary before application
+// code sees this model.
+export interface LocalActiveTimer {
+  start: string;
+  operationId?: string;
+  entryId?: undefined;
+}
+
+export interface TogglActiveTimer {
+  start: string;
+  entryId: number;
+}
+
+export interface StartingTogglTimer {
+  state: 'starting';
+  operationId: string;
+  start: string;
+  claimedAt: Timestamp;
+}
+
+export interface UnknownTogglTimerOutcome {
+  state: 'outcome-unknown';
+  operationId: string;
+  start: string;
+  claimedAt: Timestamp;
+  error: string;
+}
+
+export interface StoppingTogglTimer {
+  state: 'stopping';
+  entryId: number;
+  start: string;
+  queueId: string;
+}
+
+export type LegacyActiveTimer =
+  | LocalActiveTimer
+  | TogglActiveTimer
+  | StartingTogglTimer
+  | UnknownTogglTimerOutcome
+  | StoppingTogglTimer;
+
+export type ActiveTimer = LegacyActiveTimer | TimerV2;
+
+interface BookBase extends BookMetadata, CatalogLink {
+  id: string;
+  currentPage: number;
+  // The update-row id that most recently set currentPage. The decoder maps
+  // unmigrated stored books to null; application code always handles the
+  // field explicitly.
+  currentPageUpdateId: string | null;
+  pageCount: number;
+  pagesRead: number;
+  timeRead: number;
+  title: string;
+  finished: boolean;
+  // The moment the book was marked finished; null while unfinished.
+  finishedAt: Timestamp | null;
+  // The moment of the newest reading activity (utils/lastRead.ts); null
+  // for a book never read. Orders the reading list; metadata edits move
+  // updatedAt, never this.
+  lastReadAt: Timestamp | null;
+  isbn: string;
+  owner: DocumentReference;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  activeTimer: ActiveTimer | null;
+}
+
+export interface CurrentBook extends BookBase {
+  authorIds: string[];
+  author?: never;
+  authors?: never;
+}
+
+interface LegacyBookBase extends BookBase {
+  // An old writer may leave stale ids beside the legacy fields. The legacy
+  // fields remain authoritative until the reconciliation migration runs.
+  authorIds?: string[];
+}
+
+export interface LegacyStringAuthorBook extends LegacyBookBase {
+  author: string;
+  authors?: LegacyEmbeddedAuthor[];
+}
+
+export interface LegacyEmbeddedAuthorsBook extends LegacyBookBase {
+  author?: string;
+  authors: LegacyEmbeddedAuthor[];
+}
+
+export type Book = CurrentBook | LegacyStringAuthorBook | LegacyEmbeddedAuthorsBook;
+
+export function isTogglTimer(timer: ActiveTimer): timer is TogglActiveTimer {
+  return !('state' in timer) && 'entryId' in timer && timer.entryId !== undefined;
+}

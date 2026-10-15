@@ -1,0 +1,100 @@
+import assert from 'node:assert/strict';
+import { readdirSync, readFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import test from 'node:test';
+import { gzipSync } from 'node:zlib';
+
+const chunksDirectory = 'public/_app/immutable';
+const javascriptFiles = readdirSync(chunksDirectory, { recursive: true })
+  .filter((file): file is string => typeof file === 'string' && file.endsWith('.js'))
+  .map((file) => join(chunksDirectory, file));
+
+test('the production JavaScript bundle stays within its transfer budget', () => {
+  const gzipSizes = javascriptFiles.map((file) => ({
+    file: basename(file),
+    bytes: gzipSync(readFileSync(file)).byteLength
+  }));
+  const totalBytes = gzipSizes.reduce((total, chunk) => total + chunk.bytes, 0);
+  const largestChunk = gzipSizes.toSorted((a, b) => b.bytes - a.bytes)[0];
+
+  // Budgets raised 230/145 -> 255/170 KiB when Firestore offline persistence
+  // (persistentLocalCache) was enabled; it adds ~16 KiB to the Firestore chunk.
+  // Total raised 255 -> 258 KiB for the authors entity (autocomplete
+  // component + name utilities, ~1 KiB) — the old budget had <1 KiB headroom.
+  // Total raised 258 -> 261 KiB for id-only author refs: the chips input
+  // and client-side join fit inside the old budget (the legacy write path
+  // they replaced paid for them), the ~2 KiB is the /authors management
+  // route (rename/merge/sortName) and its author mutations.
+  // Total raised 261 -> 268 KiB for public profiles: the anonymous
+  // /profiles/<username> route, the Me page share card + payload sync, and
+  // the profile Database methods (~4 KiB), plus ~3 KiB headroom.
+  // Total raised 268 -> 275 KiB for profile handles + the all-time
+  // heatmap: nine svelte-awesome icon paths, the links editor/renderer,
+  // and the per-year grid stack (~5 KiB), plus ~2 KiB headroom.
+  // Total raised 275 -> 290 KiB for the Me-page analytics: the session
+  // stats module, hand-rolled bar/line chart primitives, and six section
+  // components (speed, clock, cadence, in-progress, authors, records,
+  // ~7 KiB), plus headroom.
+  // Total raised 290 -> 292 KiB for signed-in app prefetch: the idle
+  // lifecycle and dynamic prefetch entry add just under 1 KiB.
+  // Total raised 292 -> 298 KiB for the strict TypeScript boundary work:
+  // Firestore/API runtime decoders and explicit uncertain Toggl lifecycle
+  // UI add 5.3 KiB compressed. These checks are executable validation,
+  // not erased type annotations, so the transfer cost is intentional.
+  // Total raised 298 -> 299 KiB for runtime validation of the server-owned
+  // Toggl queue expiry field. The check adds under 0.1 KiB; the one-byte
+  // headroom at 298 KiB could not accommodate a new persisted field safely.
+  // Total raised 299 -> 303 KiB for the reviewed correctness fixes that keep
+  // corrupt author/admin records repairable, surface authentication failures,
+  // preserve offline reading writes, and serialize timer lifecycle claims.
+  // A build at the prior budget-setting commit measures 298.0 KiB; the timer
+  // claim work itself adds under 1 KiB and the complete reviewed set adds 3.9 KiB.
+  // Total raised 303 -> 305 KiB for profile search opt-in: the owner-only
+  // marker listener/decoder, two atomic write paths, and the Me-page switch
+  // add 0.3 KiB compressed, with the remainder retained as explicit headroom.
+  // Total raised 305 -> 324 KiB for shared works: catalog suggestions and
+  // runtime decoders, the work/readers route, sharing controls, and the
+  // admin curation route add 15.1 KiB compressed, with explicit headroom.
+  // Total raised 324 -> 326 KiB when integrating the App Check monitoring
+  // client from the current base; the merged production build is 324.7 KiB.
+  // Total raised 326 -> 330 KiB for user-created catalog works: the create
+  // request builder, response decoder and modal wiring add ~0.7 KiB, plus
+  // headroom so the next field does not need a budget commit.
+  // Master raised 305 -> 306 KiB for the explicit finishedAt in the same
+  // period; the 330 KiB cap above already covers that stamp.
+  // Total raised 330 -> 336 KiB for the live catalog console: the shared
+  // scan (shared/catalogScan.ts, ~3 KiB compressed) now runs in the
+  // operator's browser over listener stores, replacing the scan callable and
+  // its response decoder; the build measures 333.8 KiB, the rest is headroom.
+  // Total raised 336 -> 346 KiB for the console split into an overview and
+  // one page per work and per author, with every operation in one dialog
+  // (src/lib/components/admin, src/lib/utils/adminCatalogView.ts): two
+  // routes and the dialog add 7.1 KiB compressed; the build measures
+  // 343.1 KiB, the rest is headroom.
+  // Total raised 346 -> 350 KiB for the tabbed overview: URL-backed tabs,
+  // search, paging and filters plus the review-mark action add 3.2 KiB
+  // compressed; the build measures 346.3 KiB, the rest is headroom.
+  // Total raised 350 -> 356 KiB for languages: the shared language module
+  // (codes, labels, ISBN groups), the work default and edition override in
+  // the console and the add-book flow, and the carried copy on books add
+  // 1.7 KiB compressed; the build measures 349.7 KiB, the rest is headroom.
+  // Total raised 356 -> 370 KiB for direct time tracking: the shared wire
+  // validators, revision-aware timer reader, IndexedDB recovery, and provider
+  // settings/review UI bring the measured build to 368.1 KiB compressed.
+  // The largest-chunk limit stays at 170 KiB; recovery is dynamically loaded.
+  // Total raised 370 -> 390 KiB for the to-read plan (docs/to-read-plan.md):
+  // the /to-read route chunk (queue with pointer and keyboard reorder,
+  // summary, add/edit, start and estimate dialogs) is 14.4 KiB compressed
+  // and loads only on that route; the shared chunks grow 4.9 KiB for the
+  // plan stores, decoders, rank arithmetic, the catalog draft shared with
+  // the add-book dialog, and the navigation entry. Measured 368.1 -> 387.4
+  // KiB; the rest is headroom. No dependency was added.
+  assert.ok(
+    totalBytes <= 390 * 1024,
+    `Expected at most 390 KiB of compressed JavaScript, received ${(totalBytes / 1024).toFixed(1)} KiB`
+  );
+  assert.ok(
+    largestChunk.bytes <= 170 * 1024,
+    `Largest compressed chunk is ${largestChunk.file} at ${(largestChunk.bytes / 1024).toFixed(1)} KiB`
+  );
+});

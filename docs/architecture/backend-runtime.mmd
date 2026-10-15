@@ -1,0 +1,85 @@
+---
+title: Backend responsibilities and data flows
+---
+flowchart TB
+  accTitle: Book Tracker backend responsibilities and data flows
+  accDescr: High-level request and event paths show how published profiles, book information, issue reporting, restricted operations, optional time tracking, offline recovery, and lifecycle cleanup move through the backend without exposing deployment details.
+
+  classDef source fill:#f7f8f8,stroke:#8b9691,color:#263331,stroke-width:2px;
+  classDef mediation fill:#fff7e8,stroke:#b98a3c,color:#5b421f,stroke-width:2px;
+  classDef service fill:#edf4f6,stroke:#497789,color:#173d4a,stroke-width:2px;
+  classDef data fill:#eaf7ef,stroke:#2e7d55,color:#17482f,stroke-width:2px;
+  classDef external fill:#f7f3ed,stroke:#9b7b52,color:#4c3926,stroke-width:2px;
+  classDef note fill:#ffffff,stroke:#8b9691,color:#40504d,stroke-width:1px,stroke-dasharray:4 3;
+
+  subgraph publicpath[Published profiles]
+    direction LR
+    webrequest["<b>Visitor or indexer</b><br/>Published profile request"]:::source
+    webdelivery["<b>Web delivery layer</b><br/>Routes dynamic profile traffic"]:::mediation
+    publicrenderer["<b>Profile renderer</b><br/>Checks publication state<br/>and builds a public response"]:::service
+    publicprojection[("<b>Published profile projection</b><br/>Only fields intended for sharing")]:::data
+    webresponse["<b>Public response</b><br/>Page, data projection, or not found"]:::source
+    webrequest --> webdelivery --> publicrenderer --> publicprojection --> webresponse
+  end
+
+  subgraph metadatapath[Book information]
+    direction LR
+    bookdialog["<b>Signed-in reader</b><br/>Adds or edits a book"]:::source
+    metadataapi["<b>Book information service</b><br/>Authorizes and validates requests"]:::service
+    catalog["<b>External catalog service</b><br/>Book metadata"]:::external
+    bookresult[("<b>Normalized book information</b><br/>Safe fields returned to the app")]:::data
+    bookdialog --> metadataapi --> catalog --> bookresult
+  end
+
+  subgraph sharedcatalogpath[Shared book catalog]
+    direction LR
+    catalogreader["<b>Signed-in reader</b><br/>Searches or opens a shared Work"]:::source
+    catalogservice["<b>Catalog service</b><br/>Resolves shared authors and books<br/>and returns bounded reader summaries"]:::service
+    sharedcatalog[("<b>Shared catalog</b><br/>Authors · Works · Editions<br/>and consented reader projections")]:::data
+    catalogoperator["<b>Authorized operator</b><br/>Previews and applies curation"]:::source
+    catalogreader --> catalogservice --> sharedcatalog
+    catalogoperator --> catalogservice
+  end
+
+  subgraph operationspath[Issue reporting and restricted operations]
+    direction LR
+    clientissue["<b>Signed-in app</b><br/>Bounded issue report"]:::source
+    issuereporter["<b>Issue reporting service</b><br/>Validates and attributes the report"]:::service
+    operations[("<b>Operations data</b><br/>Bounded reports and access records")]:::data
+    operator["<b>Authorized operator</b><br/>Requests an operational summary"]:::source
+    overview["<b>Restricted overview service</b><br/>Checks authorization<br/>and returns aggregates"]:::service
+    clientissue --> issuereporter --> operations
+    operator --> overview --> operations
+  end
+
+  subgraph timerpath[Optional time tracking]
+    direction LR
+    timerbrowser["<b>Signed-in reader</b><br/>Connects or uses a reading timer"]:::source
+    timerapi["<b>Integration service</b><br/>Authorizes requests and protects credentials"]:::service
+    timerstate[("<b>Private timer state</b><br/>Connection revisions · shared timer claim<br/>immutable acceptance records")]:::data
+    timerprovider["<b>External time-tracking service</b><br/>Reading activity"]:::external
+    timerbrowser --> timerapi --> timerstate
+    timerapi --> timerprovider
+  end
+
+  subgraph offlinepath[Offline recovery]
+    direction LR
+    offlinebrowser["<b>Device goes offline</b><br/>Finishes a timer action"]:::source
+    localqueue["<b>Durable client queue</b><br/>Preserves original intent until server acceptance"]:::mediation
+    syncedwork[("<b>Validated deferred work</b><br/>Owner-scoped recovery state")]:::data
+    syncworker["<b>Synchronization worker</b><br/>Claims work · freezes requests<br/>retries or requests review"]:::service
+    syncprovider["<b>External integration</b><br/>Receives the recovered activity"]:::external
+    offlinebrowser --> localqueue -->|"reconnect"| syncedwork --> syncworker --> syncprovider
+  end
+
+  subgraph lifecyclepath[Account and data lifecycle]
+    direction LR
+    lifecycleevent["<b>Managed lifecycle event</b><br/>Account or application data changes"]:::mediation
+    cleanupworker["<b>Lifecycle worker</b><br/>Applies cleanup and retention policy"]:::service
+    relateddata[("<b>Related application data</b><br/>Updated or retired consistently")]:::data
+    lifecycleevent --> cleanupworker --> relateddata
+  end
+
+  observability["<b>Shared operational behavior</b><br/>Backend components emit bounded health and issue signals.<br/>Operational controls watch availability and failed background work."]:::note
+
+  publicpath ~~~ metadatapath ~~~ sharedcatalogpath ~~~ operationspath ~~~ timerpath ~~~ offlinepath ~~~ lifecyclepath ~~~ observability

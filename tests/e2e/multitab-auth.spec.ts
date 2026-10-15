@@ -1,0 +1,177 @@
+import { randomUUID } from 'node:crypto';
+import { deleteApp, initializeApp } from 'firebase-admin/app';
+import { getAuth } from 'firebase-admin/auth';
+import { FieldValue, Timestamp, getFirestore } from 'firebase-admin/firestore';
+import { expect, test, type ConsoleMessage, type Page } from '@playwright/test';
+
+const PROJECT_ID = 'book-tracker-d8f24';
+const TEST_PASSWORD = 'valid-test-password';
+
+function requireLocalEmulators(): void {
+  const firestoreHost = process.env.FIRESTORE_EMULATOR_HOST;
+  const authHost = process.env.FIREBASE_AUTH_EMULATOR_HOST;
+  if (!/^(?:127\.0\.0\.1|localhost):8080$/.test(firestoreHost ?? '')) {
+    throw new Error(`Expected the local Firestore emulator, got ${firestoreHost ?? 'unset'}`);
+  }
+  if (!/^(?:127\.0\.0\.1|localhost):9099$/.test(authHost ?? '')) {
+    throw new Error(`Expected the local Auth emulator, got ${authHost ?? 'unset'}`);
+  }
+}
+
+function capturePermissionErrors(page: Page, errors: string[]): void {
+  page.on('console', (message: ConsoleMessage) => {
+    if (message.type() !== 'error') return;
+    const text = message.text();
+    if (/permission-denied|false for 'list'/i.test(text)) errors.push(text);
+  });
+}
+
+test('a live book and author listener survives reloading the original tab', async ({ browser }) => {
+  requireLocalEmulators();
+
+  const suffix = randomUUID();
+  const uid = `multitab-${suffix}`;
+  const email = `${uid}@example.test`;
+  const authorId = `author-${suffix}`;
+  const bookId = `book-${suffix}`;
+  const initialAuthor = `Initial Author ${suffix}`;
+  const updatedAuthor = `Updated Author ${suffix}`;
+  const initialTitle = `Initial Book ${suffix}`;
+  const updatedTitle = `Updated Book ${suffix}`;
+  const adminApp = initializeApp({ projectId: PROJECT_ID }, `multitab-${suffix}`);
+  const auth = getAuth(adminApp);
+  const db = getFirestore(adminApp);
+  const userRef = db.doc(`users/${uid}`);
+  const authorRef = db.doc(`catalogAuthors/${authorId}`);
+  const bookRef = userRef.collection('books').doc(bookId);
+
+  await auth.createUser({ uid, email, password: TEST_PASSWORD, emailVerified: true });
+  await userRef.set({ uid, email });
+  await authorRef.set({
+    canonicalName: initialAuthor,
+    alternateNames: [],
+    nameKeys: [initialAuthor.toLowerCase()],
+    sortName: initialAuthor,
+    kind: 'entity',
+    status: 'active',
+    mergedFrom: [],
+    createdAt: Timestamp.now(),
+    updatedAt: Timestamp.now(),
+  });
+  await bookRef.set({
+    owner: userRef,
+    authorIds: [authorId],
+    title: initialTitle,
+    activeTimer: null,
+    currentPage: 10,
+    currentPageUpdateId: null,
+    pageCount: 100,
+    finished: false,
+    pagesRead: 10,
+    timeRead: 20,
+    isbn: '',
+    coverUrl: '',
+    publisher: '',
+    publishedDate: '',
+    subjects: [],
+    fiction: null,
+    createdAt: Timestamp.now(),
+    updatedAt: Timestamp.now(),
+  });
+
+  const context = await browser.newContext();
+  const permissionErrors: string[] = [];
+  const first = await context.newPage();
+  capturePermissionErrors(first, permissionErrors);
+
+  try {
+    await first.goto('/');
+    await first.getByLabel('Email address', { exact: true }).fill(email);
+    await first.getByLabel('Password', { exact: true }).fill(TEST_PASSWORD);
+    await first.getByRole('button', { name: 'Log in', exact: true }).click();
+    await expect(first.getByText(initialTitle, { exact: true })).toBeVisible();
+    await expect(first.getByText(`${initialAuthor}:`, { exact: true })).toBeVisible();
+
+    const primaryNavigation = first.getByRole('navigation', { name: 'Primary navigation' });
+    await expect(primaryNavigation.getByRole('link', { name: 'Reading', exact: true }))
+      .toHaveAttribute('aria-current', 'page');
+    await expect(primaryNavigation.getByRole('link', { name: 'Finished', exact: true })).toBeVisible();
+    await expect(primaryNavigation.getByRole('link', { name: 'Dashboard', exact: true })).toBeVisible();
+    await primaryNavigation.getByRole('button', { name: '+ Add book', exact: true }).click();
+    await expect(first.getByRole('dialog', { name: 'Add new book' })).toBeVisible();
+    await first.getByRole('dialog', { name: 'Add new book' })
+      .getByRole('button', { name: 'Close', exact: true }).click();
+
+    await first.setViewportSize({ width: 390, height: 844 });
+    const brandBox = await first.getByRole('link', { name: 'Book Tracker home' }).boundingBox();
+    const readingBox = await primaryNavigation.getByRole('link', { name: 'Reading', exact: true })
+      .boundingBox();
+    expect(brandBox).not.toBeNull();
+    expect(readingBox).not.toBeNull();
+    expect(readingBox?.y).toBeGreaterThan((brandBox?.y ?? 0) + 30);
+    await first.setViewportSize({ width: 1280, height: 720 });
+
+    // An already-running pre-hotfix tab has completed its startup setter and
+    // listens to this same browserLocal/localStorage record. Keeping this tab
+    // alive while the second (new-client) tab initializes exercises the mixed
+    // rollout boundary: the new client must not migrate or remove that record.
+    const authStorageKey = await first.evaluate(() => (
+      Object.keys(localStorage).find((key) => key.startsWith('firebase:authUser:')) ?? null
+    ));
+    expect(authStorageKey).not.toBeNull();
+
+    const second = await context.newPage();
+    capturePermissionErrors(second, permissionErrors);
+    await second.goto('/');
+    await expect(second.getByText(initialTitle, { exact: true })).toBeVisible();
+    await expect(second.getByText(`${initialAuthor}:`, { exact: true })).toBeVisible();
+    expect(await first.evaluate((key) => localStorage.getItem(key), authStorageKey as string)).not.toBeNull();
+
+    // Reload the original Firestore primary while another same-origin tab is
+    // alive. A startup setPersistence call can transiently remove the shared
+    // Auth user; the surviving tab then runs this tab's shared targets without
+    // credentials and permanently rejects their onSnapshot listeners.
+    await first.reload();
+    await expect(first.getByText(initialTitle, { exact: true })).toBeVisible();
+    expect(await first.evaluate((key) => localStorage.getItem(key), authStorageKey as string)).not.toBeNull();
+
+    await db.runTransaction(async (transaction) => {
+      transaction.update(bookRef, { title: updatedTitle, updatedAt: FieldValue.serverTimestamp() });
+      transaction.update(authorRef, {
+        canonicalName: updatedAuthor,
+        nameKeys: [updatedAuthor.toLowerCase()],
+        sortName: updatedAuthor,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    });
+
+    // The second tab proves the emulator mutation landed. Requiring the
+    // reloaded tab to observe the same sentinel changes proves its listeners
+    // are live; merely rendering IndexedDB's cached initial rows cannot pass.
+    await expect(second.getByText(updatedTitle, { exact: true })).toBeVisible();
+    await expect(second.getByText(`${updatedAuthor}:`, { exact: true })).toBeVisible();
+    await expect(first.getByText(updatedTitle, { exact: true })).toBeVisible();
+    await expect(first.getByText(`${updatedAuthor}:`, { exact: true })).toBeVisible();
+    await expect(first.getByText(/Couldn't load .+ \(permission-denied\)\./)).toHaveCount(0);
+    expect(permissionErrors).toEqual([]);
+
+    // A queued personal edit is visible from the persistent cache before
+    // reconnect and then reaches the server without reopening the app.
+    const offlineTitle = 'Offline edited ' + suffix;
+    await context.setOffline(true);
+    await first.getByRole('button', {name: 'Edit ' + updatedTitle, exact: true}).click();
+    await first.getByLabel('Book title', {exact: true}).fill(offlineTitle);
+    await first.getByRole('button', {name: 'Update book', exact: true}).click();
+    await expect(first.getByText(offlineTitle, {exact: true})).toBeVisible();
+    expect((await bookRef.get()).get('title')).toBe(updatedTitle);
+    await context.setOffline(false);
+    await expect.poll(async () => (await bookRef.get()).get('title')).toBe(offlineTitle);
+    await expect(second.getByText(offlineTitle, {exact: true})).toBeVisible();
+  } finally {
+    await context.close();
+    await db.recursiveDelete(userRef);
+    await authorRef.delete();
+    await auth.deleteUser(uid);
+    await deleteApp(adminApp);
+  }
+});

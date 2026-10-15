@@ -1,0 +1,802 @@
+import { randomUUID } from "node:crypto";
+import { initializeApp, deleteApp } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
+import { getFirestore, Timestamp } from "firebase-admin/firestore";
+import { test, expect, type Page } from "@playwright/test";
+import {
+  decodeTimerIntent,
+  initialQueue,
+  operationAck,
+} from "../../shared/timeTracking.ts";
+
+async function deviceRows(page: Page): Promise<unknown[]> {
+  return page.evaluate(
+    () =>
+      new Promise<unknown[]>((resolve, reject) => {
+        const open = indexedDB.open("book-tracker-timer-outbox", 1);
+        open.onerror = () => reject(open.error);
+        open.onsuccess = () => {
+          const database = open.result;
+          const read = database
+            .transaction("operations")
+            .objectStore("operations")
+            .getAll();
+          read.onerror = () => reject(read.error);
+          read.onsuccess = () => {
+            const rows: unknown = read.result;
+            database.close();
+            if (!Array.isArray(rows)) reject(new Error("Invalid outbox"));
+            else resolve(rows);
+          };
+        };
+      }),
+  );
+}
+async function fixture(provider: "none" | "toggl") {
+  if (
+    process.env.FIRESTORE_EMULATOR_HOST !== "127.0.0.1:8080" ||
+    process.env.FIREBASE_AUTH_EMULATOR_HOST !== "127.0.0.1:9099"
+  )
+    throw new Error("Local emulators required.");
+  const uid = `timer-browser-${randomUUID()}`,
+    email = `${uid}@example.test`,
+    password = "local-browser-test-password";
+  const app = initializeApp({ projectId: "book-tracker-d8f24" }, uid),
+    db = getFirestore(app),
+    auth = getAuth(app),
+    user = db.doc(`users/${uid}`),
+    book = user.collection("books").doc("reading");
+  const revision = randomUUID();
+  const connection =
+    provider === "none"
+      ? { provider, revision }
+      : {
+          provider,
+          revision,
+          accountId: "1",
+          workspaceId: 123,
+          projectId: 456,
+        };
+  await auth.createUser({ uid, email, password, emailVerified: true });
+  await user.set({ uid, email, timeTracking: connection });
+  await db
+    .doc("configuration/timeTracking")
+    .set({ threeggleEnabled: false, timerWriteVersion: 2 });
+  await user
+    .collection("timerLifecycle")
+    .doc("current")
+    .set({ version: 1, state: "idle", cleared: null });
+  if (provider === "toggl")
+    await getFirestore(app, "secrets")
+      .doc(`timeTrackingTokens/${uid}/revisions/${revision}`)
+      .set({ apiToken: "emulator-token" });
+  const author = db.doc(`catalogAuthors/${uid}`);
+  await author.set({
+    canonicalName: "Timer Author",
+    alternateNames: [],
+    nameKeys: ["timer author"],
+    sortName: "Timer Author",
+    kind: "entity",
+    status: "active",
+    mergedFrom: [],
+    createdAt: Timestamp.now(),
+    updatedAt: Timestamp.now(),
+  });
+  await book.set({
+    owner: user,
+    authorIds: [uid],
+    title: "Offline reading book",
+    activeTimer: null,
+    currentPage: 10,
+    currentPageUpdateId: null,
+    pageCount: 100,
+    finished: false,
+    pagesRead: 10,
+    timeRead: 20,
+    isbn: "",
+    coverUrl: "",
+    publisher: "",
+    publishedDate: "",
+    subjects: [],
+    fiction: null,
+    createdAt: Timestamp.now(),
+    updatedAt: Timestamp.now(),
+  });
+  return {
+    uid,
+    email,
+    password,
+    db,
+    user,
+    book,
+    cleanup: async () => {
+      await db.recursiveDelete(user);
+      await getFirestore(app, "secrets").recursiveDelete(
+        getFirestore(app, "secrets").doc(`timeTrackingTokens/${uid}`),
+      );
+      await author.delete();
+      await auth.deleteUser(uid);
+      await db.doc("configuration/timeTracking").delete();
+      await deleteApp(app);
+    },
+  };
+}
+
+for (const provider of ["none", "toggl"] as const)
+  test(`${provider}: offline start/stop survives reload and leaves durable acknowledgements`, async ({
+    page,
+    context,
+  }) => {
+    const f = await fixture(provider);
+    page.on("dialog", (dialog) => dialog.dismiss());
+    try {
+      await page.goto("/");
+      await page.getByLabel("Email address", { exact: true }).fill(f.email);
+      await page.getByLabel("Password", { exact: true }).fill(f.password);
+      await page.getByRole("button", { name: "Log in", exact: true }).click();
+      const start = page.getByRole("button", {
+        name: "Start a reading timer for Offline reading book",
+        exact: true,
+      });
+      await expect(start).toBeEnabled();
+      // Only the reading client goes offline; the real local Functions worker
+      // remains available to receive the queued completed interval on reconnect.
+      await context.setOffline(true);
+      await start.click();
+      await expect(
+        page.getByRole("button", {
+          name: "Stop the reading timer for Offline reading book",
+          exact: true,
+        }),
+      ).toBeVisible();
+      await expect(
+        page.getByRole("button", {
+          name: "Stop the reading timer for Offline reading book",
+          exact: true,
+        }),
+      ).toContainText("0:02");
+      await page
+        .getByRole("button", {
+          name: "Stop the reading timer for Offline reading book",
+          exact: true,
+        })
+        .click();
+      await page.getByRole("button", { name: "Close", exact: true }).click();
+      await expect(start).toBeVisible();
+      await context.setOffline(false);
+      await page.reload();
+      await expect(start).toBeEnabled();
+      await expect
+        .poll(
+          async () => (await f.user.collection("timerOperations").get()).size,
+        )
+        .toBe(2);
+      expect((await f.book.get()).get("activeTimer")).toBeNull();
+      const rows = await f.user.collection("timeTrackingQueue").get();
+      if (provider === "none") expect(rows.size).toBe(0);
+      else {
+        expect(rows.size).toBe(1);
+        await expect
+          .poll(async () => (await rows.docs[0].ref.get()).get("status"))
+          .toBe("synced");
+      }
+      const second = await context.newPage();
+      await second.goto("/");
+      await expect(
+        second.getByRole("button", {
+          name: "Start a reading timer for Offline reading book",
+          exact: true,
+        }),
+      ).toBeEnabled();
+      await page.reload();
+      await expect(start).toBeEnabled();
+      expect((await f.user.collection("timerOperations").get()).size).toBe(2);
+      await second.close();
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+test("a rejected offline revision keeps its interval through reload and explicit sign-out review", async ({
+  page,
+  context,
+}) => {
+  const f = await fixture("none");
+  try {
+    await page.goto("/");
+    await page.getByLabel("Email address", { exact: true }).fill(f.email);
+    await page.getByLabel("Password", { exact: true }).fill(f.password);
+    await page.getByRole("button", { name: "Log in", exact: true }).click();
+    const start = page.getByRole("button", {
+      name: "Start a reading timer for Offline reading book",
+      exact: true,
+    });
+    await expect(start).toBeEnabled();
+    await context.setOffline(true);
+    await start.click();
+    const stop = page.getByRole("button", {
+      name: "Stop the reading timer for Offline reading book",
+      exact: true,
+    });
+    await expect(stop).toContainText("0:02");
+    await stop.click();
+    await page.getByRole("button", { name: "Close", exact: true }).click();
+    await expect.poll(() => deviceRows(page)).toHaveLength(2);
+    await f.user.update({
+      timeTracking: { provider: "none", revision: randomUUID() },
+    });
+    await context.setOffline(false);
+    await page.reload();
+    await expect(start).toBeEnabled();
+    await page.goto("/me#time-tracking");
+    await expect(page.getByText("Saved on this device · recovery")).toHaveCount(
+      2,
+    );
+    await page.reload();
+    await expect(page.getByText("Saved on this device · recovery")).toHaveCount(
+      2,
+    );
+    expect((await f.user.collection("timerOperations").get()).size).toBe(0);
+    expect((await f.user.collection("timeTrackingQueue").get()).size).toBe(0);
+    await expect(
+      page.getByRole("button", { name: "Open reading form", exact: true }),
+    ).toBeVisible();
+    const cancelSignOut = page.waitForEvent("dialog").then(async (dialog) => {
+      expect(dialog.type()).toBe("confirm");
+      await dialog.dismiss();
+    });
+    await page.getByRole("button", { name: "Sign Out", exact: true }).click();
+    await cancelSignOut;
+    await expect(page.getByText("Saved on this device · recovery")).toHaveCount(
+      2,
+    );
+    const confirmSignOut = page.waitForEvent("dialog").then(async (dialog) => {
+      expect(dialog.type()).toBe("confirm");
+      await dialog.accept();
+    });
+    // Sign-out clears Firestore persistence and reloads. The transient
+    // signed-out render before that reload is not ready for a new login.
+    const signedOutReload = page.waitForEvent("load");
+    await page.getByRole("button", { name: "Sign Out", exact: true }).click();
+    await confirmSignOut;
+    await signedOutReload;
+    await expect(
+      page.getByRole("button", { name: "Log in", exact: true }),
+    ).toBeVisible();
+    await page.getByLabel("Email address", { exact: true }).fill(f.email);
+    await page.getByLabel("Password", { exact: true }).fill(f.password);
+    await page.getByRole("button", { name: "Log in", exact: true }).click();
+    // Cache cleanup returns to Reading; Sign Out belongs to Settings only.
+    await expect(start).toBeEnabled();
+    await page.goto("/me#time-tracking");
+    await expect(page.getByText("Saved on this device · recovery")).toHaveCount(
+      0,
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+for (const scenario of [
+  "external switch",
+  "edited remote start",
+  "reader edit",
+] as const)
+  test(`online Threeggle reading form opens on the estimate and adopts the confirmed interval after ${scenario}`, async ({
+    page,
+  }) => {
+    const f = await fixture("none");
+    const connection = {
+      provider: "threeggle" as const,
+      revision: randomUUID(),
+      serviceId: "browser-test",
+      accountId: "browser-account",
+      projectId: "reading",
+    };
+    const start = new Date(Date.now() - 3600000).toISOString();
+    const timer = {
+      version: 2 as const,
+      timerId: randomUUID(),
+      operationId: randomUUID(),
+      connection,
+      state: "remote" as const,
+      start,
+      claimedAt: Date.now() - 3600000,
+      remote: { provider: "threeggle" as const, entryKey: "external-entry" },
+      queueId: null,
+      errorCode: null,
+    };
+    const finalStart =
+      scenario === "edited remote start"
+        ? new Date(Date.parse(start) + 1800000).toISOString()
+        : start;
+    const finalEnd = new Date(
+      Date.parse(finalStart) +
+        (scenario === "external switch" ? 600000 : 300000),
+    ).toISOString();
+    await f.user.update({ timeTracking: connection });
+    await f.book.update({ activeTimer: timer });
+    await f.user
+      .collection("timerLifecycle")
+      .doc("current")
+      .set({ version: 2, state: "active", bookId: f.book.id, timer });
+    let operationId: string | null = null;
+    await page.route("**/timetracking-accept", async (route) => {
+      const payload: unknown = route.request().postDataJSON();
+      if (JSON.stringify(payload) === JSON.stringify({ data: { warmup: true } }))
+        return route.fulfill({ json: { result: { warm: true } } });
+      if (
+        typeof payload !== "object" ||
+        payload === null ||
+        !("data" in payload) ||
+        typeof payload.data !== "object" ||
+        payload.data === null ||
+        !("intent" in payload.data)
+      )
+        throw new Error("Missing stop intent");
+      const intent = decodeTimerIntent(payload.data.intent);
+      expect(intent.action).toBe("stop");
+      expect(intent.remote).toEqual(timer.remote);
+      const batch = f.db.batch();
+      batch.set(f.user.collection("timerOperations").doc(intent.operationId), {
+        ...operationAck(intent, Date.now()),
+        intent,
+      });
+      batch.set(
+        f.user.collection("timeTrackingQueue").doc(intent.operationId),
+        {
+          ...initialQueue(intent, Date.now()),
+          status: "processing",
+          attempts: 1,
+          claimedAt: Date.now(),
+        },
+      );
+      await batch.commit();
+      operationId = intent.operationId;
+      await route.fulfill({
+        json: { result: { accepted: true, operationId: intent.operationId } },
+      });
+    });
+    try {
+      await page.goto("/");
+      await page.getByLabel("Email address", { exact: true }).fill(f.email);
+      await page.getByLabel("Password", { exact: true }).fill(f.password);
+      await page.getByRole("button", { name: "Log in", exact: true }).click();
+      await page
+        .getByRole("button", {
+          name: "Stop the reading timer for Offline reading book",
+          exact: true,
+        })
+        .click();
+      await expect.poll(() => operationId).not.toBeNull();
+      const minutes = page.getByRole("spinbutton", {
+        name: "Minutes read",
+        exact: true,
+      });
+      // The form opens on this device's hour before the worker confirms.
+      await expect(minutes).toHaveValue("60");
+      await expect(
+        page.getByText("Estimated from this device.", { exact: false }),
+      ).toBeVisible();
+      if (scenario === "reader edit") await minutes.fill("42");
+      if (operationId === null) throw new Error("Stop not submitted");
+      const batch = f.db.batch();
+      batch.set(f.user.collection("timeTrackingResults").doc(operationId), {
+        interval: { start: finalStart, end: finalEnd },
+        recordedAt: Date.now(),
+      });
+      batch.update(f.user.collection("timeTrackingQueue").doc(operationId), {
+        status: "synced",
+      });
+      batch.update(f.book, { activeTimer: null });
+      batch.set(f.user.collection("timerLifecycle").doc("current"), {
+        version: 2,
+        state: "idle",
+        cleared: { bookId: f.book.id, timerId: timer.timerId, operationId },
+      });
+      await batch.commit();
+      await expect(
+        page.getByText("Estimated from this device.", { exact: false }),
+      ).not.toBeVisible();
+      // A confirmed interval never overwrites the reader's own entry.
+      await expect(minutes).toHaveValue(
+        { "external switch": "10", "edited remote start": "5", "reader edit": "42" }[
+          scenario
+        ],
+      );
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+test("online Toggl reading uses the targeted stop's confirmed duration", async ({
+  page,
+}) => {
+  const f = await fixture("toggl");
+  const timer = {
+    version: 2,
+    timerId: randomUUID(),
+    operationId: randomUUID(),
+    connection: (await f.user.get()).get("timeTracking"),
+    state: "remote",
+    start: new Date(Date.now() - 3600000).toISOString(),
+    claimedAt: Date.now() - 3600000,
+    remote: { provider: "toggl", entryId: 900003 },
+    queueId: null,
+    errorCode: null,
+  };
+  await f.book.update({ activeTimer: timer });
+  await f.user
+    .collection("timerLifecycle")
+    .doc("current")
+    .set({ version: 2, state: "active", bookId: f.book.id, timer });
+  try {
+    await page.goto("/");
+    await page.getByLabel("Email address", { exact: true }).fill(f.email);
+    await page.getByLabel("Password", { exact: true }).fill(f.password);
+    await page.getByRole("button", { name: "Log in", exact: true }).click();
+    await page
+      .getByRole("button", {
+        name: "Stop the reading timer for Offline reading book",
+        exact: true,
+      })
+      .click();
+    await expect(
+      page.getByRole("spinbutton", { name: "Minutes read", exact: true }),
+    ).toHaveValue("1");
+    const rows = await f.user.collection("timeTrackingQueue").get();
+    expect(rows.size).toBe(1);
+    expect(rows.docs[0].get("prepared.action")).toBe("stop_now");
+    expect(rows.docs[0].get("status")).toBe("synced");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("explicit reader-only controls keep offline starts available after reload", async ({
+  page,
+  context,
+}) => {
+  const f = await fixture("none");
+  await f.user.set({ uid: f.uid, email: f.email });
+  await f.db
+    .doc("configuration/timeTracking")
+    .set({ timerWriteVersion: 1, threeggleEnabled: false });
+  try {
+    await page.goto("/");
+    await page.getByLabel("Email address", { exact: true }).fill(f.email);
+    await page.getByLabel("Password", { exact: true }).fill(f.password);
+    await page.getByRole("button", { name: "Log in", exact: true }).click();
+    const start = page.getByRole("button", {
+      name: "Start a reading timer for Offline reading book",
+      exact: true,
+    });
+    await expect(start).toBeEnabled();
+    await page.reload();
+    await expect(start).toBeEnabled();
+    await context.setOffline(true);
+    // The live cached document remains sufficient when network access is lost.
+    await start.click();
+    await expect(
+      page.getByRole("button", {
+        name: "Stop the reading timer for Offline reading book",
+        exact: true,
+      }),
+    ).toBeVisible();
+    await context.setOffline(false);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a permanently refused online stop closes its estimated reading form", async ({
+  page,
+}) => {
+  const f = await fixture("toggl");
+  const timer = {
+    version: 2,
+    timerId: randomUUID(),
+    operationId: randomUUID(),
+    connection: (await f.user.get()).get("timeTracking"),
+    state: "remote",
+    start: new Date(Date.now() - 600000).toISOString(),
+    claimedAt: Date.now() - 600000,
+    remote: { provider: "toggl", entryId: 900003 },
+    queueId: null,
+    errorCode: null,
+  };
+  await f.book.update({ activeTimer: timer });
+  await f.user
+    .collection("timerLifecycle")
+    .doc("current")
+    .set({ version: 2, state: "active", bookId: f.book.id, timer });
+  let refused = false;
+  page.on("dialog", async (dialog) => {
+    refused = dialog.message().includes("stop was refused");
+    await dialog.dismiss();
+  });
+  await page.route("**/timetracking-accept", (route) =>
+    JSON.stringify(route.request().postDataJSON()) ===
+    JSON.stringify({ data: { warmup: true } })
+      ? route.fulfill({ json: { result: { warm: true } } })
+      : route.fulfill({
+      status: 400,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          status: "FAILED_PRECONDITION",
+          message: "This timer has changed.",
+        },
+      }),
+    }),
+  );
+  try {
+    await page.goto("/");
+    await page.getByLabel("Email address", { exact: true }).fill(f.email);
+    await page.getByLabel("Password", { exact: true }).fill(f.password);
+    await page.getByRole("button", { name: "Log in", exact: true }).click();
+    await page
+      .getByRole("button", {
+        name: "Stop the reading timer for Offline reading book",
+        exact: true,
+      })
+      .click();
+    await expect.poll(() => refused).toBe(true);
+    // The estimate form opened at once and closed on the refusal. Waiting out
+    // the confirmation timeout proves it does not reopen.
+    await page.waitForTimeout(16000);
+    await expect(
+      page.getByRole("dialog", { name: "Offline reading book", exact: true }),
+    ).toHaveCount(0);
+    expect((await f.book.get()).get("activeTimer.state")).toBe("remote");
+    await expect
+      .poll(async () =>
+        (await deviceRows(page)).some(
+          (row) =>
+            typeof row === "object" &&
+            row !== null &&
+            "state" in row &&
+            row.state === "recovery",
+        ),
+      )
+      .toBe(true);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("completed recovered starts offer confirmed reading time and retain their receipt after recording", async ({
+  page,
+}) => {
+  const f = await fixture("none");
+  const operationId = randomUUID();
+  const interval = {
+    start: new Date(Date.now() - 600000).toISOString(),
+    end: new Date().toISOString(),
+  };
+  const intent = decodeTimerIntent({
+    version: 2,
+    action: "start",
+    operationId,
+    timerId: randomUUID(),
+    bookId: f.book.id,
+    connection: {
+      provider: "threeggle",
+      revision: "test",
+      serviceId: "test",
+      accountId: "test",
+      projectId: "reading",
+    },
+    start: interval.start,
+    end: null,
+    description: "Offline reading book",
+    remote: null,
+  });
+  await f.user
+    .collection("timeTrackingQueue")
+    .doc(operationId)
+    .set({ ...initialQueue(intent, Date.now()), status: "synced" });
+  const result = f.user.collection("timeTrackingResults").doc(operationId);
+  await result.set({
+    readingPending: true,
+    bookId: f.book.id,
+    description: intent.description,
+    interval,
+    recordedAt: Date.now(),
+  });
+  page.on("dialog", (dialog) => dialog.accept());
+  try {
+    await page.goto("/");
+    await page.getByLabel("Email address", { exact: true }).fill(f.email);
+    await page.getByLabel("Password", { exact: true }).fill(f.password);
+    await page.getByRole("button", { name: "Log in", exact: true }).click();
+    await page.goto("/me#time-tracking");
+    const recovered = page.getByRole("article", {
+      name: "Completed reading: Offline reading book",
+      exact: true,
+    });
+    await expect(recovered).toBeVisible();
+    await recovered
+      .getByRole("button", { name: "Open reading form", exact: true })
+      .click();
+    await expect(
+      page.getByRole("spinbutton", { name: "Minutes read", exact: true }),
+    ).toHaveValue("10");
+    await page
+      .getByRole("spinbutton", { name: "Current page", exact: true })
+      .fill("11");
+    await page.getByRole("button", { name: "Add", exact: true }).click();
+    await expect(recovered).toHaveCount(0);
+    expect((await result.get()).get("readingPending")).toBe(false);
+    expect((await result.get()).get("interval")).toEqual(interval);
+    await page.reload();
+    await expect(recovered).toHaveCount(0);
+    expect((await f.book.get()).get("timeRead")).toBe(30);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test.describe("mobile layout", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  test("running timer renders as the mobile Stop pill and returns to Start timer", async ({
+    page,
+  }) => {
+    const f = await fixture("none");
+    try {
+      await page.goto("/");
+      await page.getByLabel("Email address", { exact: true }).fill(f.email);
+      await page.getByLabel("Password", { exact: true }).fill(f.password);
+      await page.getByRole("button", { name: "Log in", exact: true }).click();
+      const start = page.getByRole("button", {
+        name: "Start a reading timer for Offline reading book",
+        exact: true,
+      });
+      await expect(start).toBeEnabled();
+      await expect(start).toHaveClass(/mobile-action-button/);
+      await expect(start).toContainText("Start timer");
+      await start.click();
+      const stop = page.getByRole("button", {
+        name: "Stop the reading timer for Offline reading book",
+        exact: true,
+      });
+      await expect(stop).toBeVisible();
+      // The Threeggle timer branch once rendered on mobile with the desktop
+      // classes and no label, leaving only bare elapsed text on the card.
+      await expect(stop).toHaveClass(/mobile-action-button/);
+      await expect(stop).toHaveClass(/stop-button/);
+      await expect(stop).toContainText("Stop");
+      await expect(stop).toContainText("0:0");
+      await stop.click();
+      await page.getByRole("button", { name: "Close", exact: true }).click();
+      await expect(start).toBeEnabled();
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("settings sections share one flat style and the sharing switch is a toggle", async ({
+    page,
+  }) => {
+    const f = await fixture("none");
+    try {
+      await page.goto("/");
+      await page.getByLabel("Email address", { exact: true }).fill(f.email);
+      await page.getByLabel("Password", { exact: true }).fill(f.password);
+      await page.getByRole("button", { name: "Log in", exact: true }).click();
+      await page.goto("/me#time-tracking");
+      const tracking = page.locator("#time-tracking");
+      await expect(tracking).toBeVisible();
+      // A flat hairline section like Profile and Sharing, not a boxed card.
+      await expect(tracking).toHaveCSS("border-top-width", "1px");
+      await expect(tracking).toHaveCSS("border-left-width", "0px");
+      await expect(
+        page.getByRole("button", { name: "Save choice", exact: true }),
+      ).toHaveCSS("background-color", "rgb(47, 102, 107)");
+      // The Sharing switch once sat outside the class its toggle styles are
+      // scoped to and rendered as a bare checkbox with run-on text.
+      const share = page.getByRole("switch", { name: /Share what you read/ });
+      await expect(share).toHaveCSS("appearance", "none");
+      await expect(share).toHaveCSS("width", "42px");
+    } finally {
+      await f.cleanup();
+    }
+  });
+});
+
+test("an idle visible reading list warms both timer callables once per throttle window", async ({
+  page,
+}) => {
+  const f = await fixture("none");
+  const connection = {
+    provider: "threeggle" as const,
+    revision: randomUUID(),
+    serviceId: "book-tracker-emulator",
+    accountId: "emulator-account",
+    projectId: "reading",
+  };
+  await f.user.update({ timeTracking: connection });
+  await f.db
+    .doc("configuration/timeTracking")
+    .set({ threeggleEnabled: true, timerWriteVersion: 2 });
+  const warmups: string[] = [];
+  page.on("request", (request) => {
+    const name = /\/(timetracking-(?:accept|context))$/.exec(request.url())?.[1];
+    if (
+      name &&
+      request.method() === "POST" &&
+      request.postData() === JSON.stringify({ data: { warmup: true } })
+    )
+      warmups.push(name);
+  });
+  const responses: unknown[] = [];
+  page.on("response", async (response) => {
+    if (
+      /\/timetracking-accept$/.test(response.url()) &&
+      response.request().postData() ===
+        JSON.stringify({ data: { warmup: true } })
+    )
+      responses.push(await response.json());
+  });
+  try {
+    await page.goto("/");
+    await page.getByLabel("Email address", { exact: true }).fill(f.email);
+    await page.getByLabel("Password", { exact: true }).fill(f.password);
+    await page.getByRole("button", { name: "Log in", exact: true }).click();
+    await expect
+      .poll(() => [...warmups].sort())
+      .toEqual(["timetracking-accept", "timetracking-context"]);
+    await expect.poll(() => responses).toEqual([{ result: { warm: true } }]);
+    // Returning to the page within the throttle window sends nothing new.
+    await page.evaluate(() =>
+      document.dispatchEvent(new Event("visibilitychange")),
+    );
+    await page.waitForTimeout(500);
+    expect(warmups).toHaveLength(2);
+    expect((await f.user.collection("timerOperations").get()).size).toBe(0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a running timer warms only the stop callable", async ({ page }) => {
+  const f = await fixture("toggl");
+  const timer = {
+    version: 2,
+    timerId: randomUUID(),
+    operationId: randomUUID(),
+    connection: (await f.user.get()).get("timeTracking"),
+    state: "remote",
+    start: new Date(Date.now() - 600000).toISOString(),
+    claimedAt: Date.now() - 600000,
+    remote: { provider: "toggl", entryId: 900003 },
+    queueId: null,
+    errorCode: null,
+  };
+  await f.book.update({ activeTimer: timer });
+  await f.user
+    .collection("timerLifecycle")
+    .doc("current")
+    .set({ version: 2, state: "active", bookId: f.book.id, timer });
+  const warmups: string[] = [];
+  page.on("request", (request) => {
+    const name = /\/(timetracking-(?:accept|context))$/.exec(request.url())?.[1];
+    if (
+      name &&
+      request.postData() === JSON.stringify({ data: { warmup: true } })
+    )
+      warmups.push(name);
+  });
+  try {
+    await page.goto("/");
+    await page.getByLabel("Email address", { exact: true }).fill(f.email);
+    await page.getByLabel("Password", { exact: true }).fill(f.password);
+    await page.getByRole("button", { name: "Log in", exact: true }).click();
+    await expect.poll(() => warmups).toEqual(["timetracking-accept"]);
+    await page.waitForTimeout(500);
+    expect(warmups).toEqual(["timetracking-accept"]);
+  } finally {
+    await f.cleanup();
+  }
+});

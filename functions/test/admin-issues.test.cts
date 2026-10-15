@@ -1,0 +1,307 @@
+require("./setup.cts");
+
+const assert: typeof import("node:assert/strict") = require("node:assert/strict");
+const test: typeof import("node:test").test = require("node:test");
+const {Timestamp}: typeof import("firebase-admin/firestore") = require("firebase-admin/firestore");
+const {
+  ANONYMOUS_ISSUE_LIMIT,
+  assembleIssueFeed,
+  FEED_LIMIT,
+  ISSUES_PER_UID,
+}: typeof import("../src/adminIssues") = require("../lib/adminIssues");
+
+type IssueGroup = import("../src/adminIssues").IssueGroup;
+type StoredIssueDocument = import("../src/adminIssues").StoredIssueDocument;
+
+const createdAt = Timestamp.fromMillis(1_700_000_000_000);
+const fallbackAt = 1_600_000_000_000;
+
+const validIssue = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+  createdAt,
+  level: "warn",
+  event: "toggl.sync_stuck",
+  message: "The sync is stuck.",
+  code: null,
+  uid: "owner",
+  detail: null,
+  ...overrides,
+});
+
+const document = (id: string, value: unknown, metadataAt = fallbackAt): StoredIssueDocument => ({
+  id,
+  value,
+  fallbackAt: metadataAt,
+});
+
+const identities = new Map([
+  ["owner", {email: "owner@example.test", verified: true}],
+]);
+
+// Rows for one account (or uid-null) as the feed query would return them.
+const group = (uid: string | null, documents: readonly StoredIssueDocument[]): IssueGroup => ({uid, documents});
+const feedOf = (documents: readonly StoredIssueDocument[], limit = 10) =>
+  assembleIssueFeed([group("owner", documents)], limit, limit, 1000, identities);
+
+test("valid issue rows retain decoded fields and resolve identities", () => {
+  const {rows, cappedAccounts, anonymousCapped} = feedOf([
+    document("known", validIssue({code: "deadline-exceeded"})),
+    document("deleted", validIssue({uid: "deleted"})),
+    document("anonymous", validIssue({uid: null, detail: {email: "claim@example.test"}})),
+  ]);
+
+  assert.equal(cappedAccounts, 0);
+  assert.equal(anonymousCapped, false);
+  assert.deepEqual(rows.map(({email, emailVerified, malformed}) => ({
+    email,
+    emailVerified,
+    malformed,
+  })), [
+    {
+      email: "owner@example.test",
+      emailVerified: true,
+      malformed: false,
+    },
+    {
+      email: "(deleted user)",
+      emailVerified: false,
+      malformed: false,
+    },
+    {
+      email: "(anonymous)",
+      emailVerified: false,
+      malformed: false,
+    },
+  ]);
+  assert.equal(rows[0].at, createdAt.toMillis());
+  assert.equal(rows[0].message, "The sync is stuck.");
+  assert.equal(rows[0].code, "deadline-exceeded");
+  assert.doesNotMatch(JSON.stringify(rows), /claim@example\.test/);
+  assert.equal(new Set(rows.map((row) => row.id)).size, rows.length);
+  for (const row of rows) assert.match(row.id, /^[a-f0-9]{64}$/);
+});
+
+test("every malformed field shape becomes the same fixed placeholder", () => {
+  const malformedValues = [
+    validIssue({level: "debug"}),
+    validIssue({event: {secret: "event-secret"}}),
+    validIssue({event: "event-secret".repeat(10)}),
+    validIssue({message: {secret: "message-secret"}}),
+    validIssue({message: "message-secret".repeat(100)}),
+    validIssue({code: {secret: "code-secret"}}),
+    validIssue({code: "code-secret".repeat(20)}),
+    validIssue({uid: {secret: "uid-secret"}}),
+    validIssue({uid: ""}),
+    validIssue({uid: "u".repeat(129)}),
+    validIssue({detail: {email: {secret: "detail-secret"}}}),
+    validIssue({detail: {email: "safe@example.test", password: "detail-secret"}}),
+    validIssue({detail: {email: "detail-secret".repeat(40)}}),
+    validIssue({createdAt: "timestamp-secret"}),
+  ];
+  const rows = feedOf(
+    malformedValues.map((value, index) => document(`malformed-${index}`, value)),
+    malformedValues.length,
+  ).rows;
+
+  assert.equal(rows.length, malformedValues.length);
+  for (const [index, row] of rows.entries()) {
+    const {id, ...safeFields} = row;
+    assert.match(id, /^[a-f0-9]{64}$/);
+    assert.notEqual(id, `malformed-${index}`);
+    assert.deepEqual(safeFields, {
+      at: index === malformedValues.length - 1 ? fallbackAt : createdAt.toMillis(),
+      level: "error",
+      event: "logEvents.malformed",
+      code: "MALFORMED_STORED_ISSUE",
+      message: "Stored issue record is malformed. Its fields were hidden.",
+      uid: null,
+      email: "(malformed issue)",
+      emailVerified: false,
+      malformed: true,
+    });
+  }
+  const rendered = JSON.stringify(rows);
+  for (const secret of [
+    "message-secret",
+    "code-secret",
+    "event-secret",
+    "uid-secret",
+    "detail-secret",
+    "timestamp-secret",
+  ]) {
+    assert.doesNotMatch(rendered, new RegExp(secret));
+  }
+});
+
+test("the feed is newest-first across accounts and keeps identity per row", () => {
+  const {rows} = assembleIssueFeed([
+    group("owner", [
+      document("owner-new", validIssue({createdAt: Timestamp.fromMillis(3_000), message: "owner new"})),
+      document("owner-old", validIssue({createdAt: Timestamp.fromMillis(1_000), message: "owner old"})),
+    ]),
+    group("stranger", [
+      document("stranger-mid", validIssue({uid: "stranger", createdAt: Timestamp.fromMillis(2_000), message: "stranger"})),
+      document("stranger-bad", validIssue({level: "attacker-level", uid: "stranger", createdAt: Timestamp.fromMillis(500)})),
+    ]),
+  ], 10, 10, 1000, identities);
+
+  assert.deepEqual(rows.map((row) => [row.message, row.email, row.at]), [
+    ["owner new", "owner@example.test", 3_000],
+    ["stranger", "(deleted user)", 2_000],
+    ["owner old", "owner@example.test", 1_000],
+    ["Stored issue record is malformed. Its fields were hidden.", "(malformed issue)", 500],
+  ]);
+  assert.equal(rows[3].malformed, true);
+  assert.equal(rows[3].uid, null);
+});
+
+test("caller-controlled document ids never cross the callable boundary", () => {
+  const secretId = "password=Secret1@example.com";
+  const rows = feedOf([
+    document(secretId, validIssue({level: "attacker-level"})),
+  ]).rows;
+
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].id, /^[a-f0-9]{64}$/);
+  assert.doesNotMatch(JSON.stringify(rows), /Secret1@example\.com/);
+});
+
+test("each account is capped at the per-account limit, uid-null rows at their own", () => {
+  const flood = Array.from({length: 12}, (_, index) =>
+    document(`flood-${index}`, validIssue({uid: "flooder", message: `flood ${index}`})));
+  const anonymous = Array.from({length: 4}, (_, index) =>
+    document(`anon-${index}`, validIssue({uid: null, message: `anon ${index}`})));
+  const {rows, cappedAccounts, cappedUids, anonymousCapped} = assembleIssueFeed([
+    group("flooder", flood.slice(0, 11)),
+    group("owner", [document("owner-1", validIssue({message: "owner"}))]),
+    group(null, anonymous),
+  ], 10, 3, 1000, identities);
+
+  assert.equal(cappedAccounts, 1);
+  // Exactly the capped accounts are named: not the honest one, not the
+  // uid-null group, and the count is that list's length.
+  assert.deepEqual(cappedUids, ["flooder"]);
+  assert.equal(anonymousCapped, true);
+  assert.equal(rows.filter((row) => row.uid === "flooder").length, 10);
+  assert.equal(rows.filter((row) => row.uid === null).length, 3);
+  assert.equal(rows.filter((row) => row.uid === "owner").length, 1);
+  // Exactly at the cap is not capped: the query reads cap + 1 to tell.
+  assert.deepEqual(
+    assembleIssueFeed([group("flooder", flood.slice(0, 10))], 10, 3, 1000, identities).cappedAccounts,
+    0,
+  );
+  // A malformed row that still names an account counts against it.
+  const capped = assembleIssueFeed([group("flooder", [
+    ...flood.slice(0, 10),
+    document("bad", validIssue({level: "attacker-level", uid: "flooder"})),
+  ])], 10, 3, 1000, identities);
+  assert.equal(capped.cappedAccounts, 1);
+  assert.deepEqual(capped.cappedUids, ["flooder"]);
+  assert.equal(capped.rows.length, 10);
+  // Two floods name two accounts, in group order, and nobody else.
+  assert.deepEqual(assembleIssueFeed([
+    group("owner", [document("owner-1", validIssue({message: "owner"}))]),
+    group("flooder", flood.slice(0, 11)),
+    group("second", flood.slice(0, 11).map((entry, index) =>
+      document(`second-${index}`, validIssue({uid: "second", message: `second ${index}`})))),
+  ], 10, 3, 1000, identities).cappedUids, ["flooder", "second"]);
+});
+
+test("the shipped feed caps are the documented ones", () => {
+  // README and the admin page copy state these numbers; the red-team of
+  // fd4f0fd found the cap could be changed to anything without a test
+  // noticing.
+  assert.equal(ISSUES_PER_UID, 10);
+  assert.equal(ANONYMOUS_ISSUE_LIMIT, 25);
+  assert.equal(FEED_LIMIT, 200);
+});
+
+test("the feed limit is shared round-robin, so a flood at the cap cannot erase an honest account", () => {
+  // Twenty flooding accounts writing exactly the cap each (so none is
+  // reported as capped) and one honest account whose rows are all older —
+  // the round-3 red-team case in which a newest-first cut showed zero
+  // honest rows.
+  const flooders = Array.from({length: 20}, (_, account) =>
+    group(`flooder-${account}`, Array.from({length: 10}, (_, index) =>
+      document(`flood-${account}-${index}`, validIssue({
+        uid: `flooder-${account}`,
+        createdAt: Timestamp.fromMillis(2_000_000 - account * 10 - index),
+        message: `flood ${account}/${index}`,
+      })))));
+  const honest = group("owner", Array.from({length: 10}, (_, index) =>
+    document(`honest-${index}`, validIssue({
+      createdAt: Timestamp.fromMillis(1_000_000 - index),
+      message: `honest ${index}`,
+    }))));
+  const feed = assembleIssueFeed([...flooders, honest], 10, 25, 200, identities);
+
+  assert.equal(feed.total, 210);
+  assert.equal(feed.rows.length, 200);
+  assert.equal(feed.cappedAccounts, 0);
+  const honestShown = feed.rows.filter((row) => row.uid === "owner");
+  // 21 groups: nine full rounds (189 rows) and eleven of the tenth.
+  assert.ok(honestShown.length >= 9, `honest rows shown: ${honestShown.length}`);
+  assert.equal(honestShown[0].message, "honest 0");
+  // Display order is still newest first.
+  for (let index = 1; index < feed.rows.length; index += 1) {
+    assert.ok(feed.rows[index - 1].at >= feed.rows[index].at);
+  }
+  // Every group is represented.
+  assert.equal(new Set(feed.rows.map((row) => row.uid)).size, 21);
+});
+
+test("the round-robin cut keeps every account's newest rows and reports the total", () => {
+  const groups = Array.from({length: 30}, (_, account) =>
+    group(`account-${account}`, Array.from({length: 10}, (_, index) =>
+      document(`row-${account}-${index}`, validIssue({
+        uid: `account-${account}`,
+        createdAt: Timestamp.fromMillis(1_000_000 - account * 10 - index),
+        message: `${account}/${index}`,
+      })))));
+  const feed = assembleIssueFeed(groups, 10, 25, 200, identities);
+  assert.equal(feed.total, 300);
+  assert.equal(feed.rows.length, 200);
+  const perAccount = new Map<string | null, number>();
+  for (const row of feed.rows) perAccount.set(row.uid, (perAccount.get(row.uid) ?? 0) + 1);
+  assert.equal(perAccount.size, 30);
+  // 200 / 30: six full rounds plus twenty of the seventh.
+  assert.equal(Math.min(...perAccount.values()), 6);
+  assert.equal(Math.max(...perAccount.values()), 7);
+  // What each account shows is its newest rows, not an arbitrary subset.
+  for (const [uid, shown] of perAccount) {
+    const messages = feed.rows.filter((row) => row.uid === uid).map((row) => row.message);
+    assert.ok(uid !== null);
+    const account = uid.replace("account-", "");
+    assert.deepEqual(messages, Array.from({length: shown}, (_, index) => `${account}/${index}`));
+  }
+  assert.equal(feed.groupsWithRows, 30);
+  assert.equal(feed.groupsShown, 30);
+  // Below the limit nothing is cut.
+  const small = assembleIssueFeed(groups.slice(0, 5), 10, 25, 200, identities);
+  assert.equal(small.rows.length, 50);
+  assert.equal(small.total, 50);
+});
+
+test("above feedLimit groups the tail is dropped and the feed says how many accounts vanished", () => {
+  const groups = Array.from({length: 230}, (_, account) =>
+    group(`account-${account}`, account % 2 === 0 ? [] : [
+      document(`row-${account}`, validIssue({uid: `account-${account}`, createdAt: Timestamp.fromMillis(1_000 + account)})),
+      document(`row-${account}-b`, validIssue({uid: `account-${account}`, createdAt: Timestamp.fromMillis(account)})),
+    ]));
+  // Empty groups consume no slot.
+  const feed = assembleIssueFeed(groups, 10, 25, 100, identities);
+  assert.equal(feed.groupsWithRows, 115);
+  assert.equal(feed.groupsShown, 100);
+  assert.equal(feed.rows.length, 100);
+  assert.equal(feed.total, 230);
+  // Each shown group shows exactly its newest row.
+  assert.ok(feed.rows.every((row) => row.at >= 1_000));
+  // With room for everyone, every group with rows is shown.
+  const roomy = assembleIssueFeed(groups, 10, 25, 200, identities);
+  assert.equal(roomy.groupsShown, 115);
+  assert.equal(roomy.groupsWithRows, 115);
+  assert.equal(roomy.rows.length, 200);
+  // Degenerate inputs neither throw nor claim anything.
+  const empty = assembleIssueFeed([], 10, 25, 200, identities);
+  assert.deepEqual(empty, {rows: [], total: 0, groupsWithRows: 0, groupsShown: 0, cappedAccounts: 0, cappedUids: [], anonymousCapped: false});
+  assert.equal(assembleIssueFeed(groups, 10, 25, 0, identities).rows.length, 0);
+});

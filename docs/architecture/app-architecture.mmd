@@ -1,0 +1,60 @@
+---
+title: Book Tracker application architecture
+---
+flowchart TB
+  accTitle: Book Tracker application architecture and trust boundaries
+  accDescr: A managed delivery layer serves the web app and published profile pages. The browser uses managed identity and owner-scoped data permissions. Backend services handle privileged operations and external integrations. Background jobs process lifecycle events and deferred work.
+
+  classDef person fill:#f7f8f8,stroke:#8b9691,color:#263331,stroke-width:2px;
+  classDef client fill:#e8f2f1,stroke:#35686a,color:#173f41,stroke-width:2px;
+  classDef delivery fill:#fff7e8,stroke:#b98a3c,color:#5b421f,stroke-width:2px;
+  classDef service fill:#edf4f6,stroke:#497789,color:#173d4a,stroke-width:2px;
+  classDef data fill:#eaf7ef,stroke:#2e7d55,color:#17482f,stroke-width:2px;
+  classDef external fill:#f7f3ed,stroke:#9b7b52,color:#4c3926,stroke-width:2px;
+  classDef security fill:#fff1f0,stroke:#b42318,color:#651c15,stroke-width:2px;
+  classDef neutral fill:#ffffff,stroke:#8b9691,color:#263331,stroke-width:1.5px;
+
+  people["<b>People and indexers</b><br/>Readers · profile visitors<br/>authorized operators · search services"]:::person
+  delivery["<b>Managed web delivery</b><br/>Static application assets<br/>and published profile responses"]:::delivery
+  browser["<b>Browser or installed app</b><br/>User interface and client state"]:::client
+  local["<b>Local persistence</b><br/>Cached app shell · account-scoped timer outbox"]:::client
+
+  identity["<b>Managed identity</b><br/>Sign-in and authenticated sessions"]:::security
+  permissions["<b>Data access controls</b><br/>Owner scope and write validation"]:::security
+  appdata[("<b>Application data</b><br/>Private libraries · shared book catalog<br/>sharing data · deferred work · operations data")]:::data
+
+  publicrenderer["<b>Public profile renderer</b><br/>Produces bounded public pages"]:::service
+  apis["<b>Backend service layer</b><br/>Authorization · validation<br/>catalog and privileged operations"]:::service
+  events["<b>Managed event delivery</b><br/>Identity and data lifecycle events"]:::neutral
+  workers["<b>Background workers</b><br/>Cleanup and deferred synchronization"]:::service
+  configuration["<b>Protected configuration</b><br/>Server-only integration credentials"]:::security
+  observability["<b>Operational telemetry</b><br/>Runtime health and issue reporting"]:::neutral
+
+  catalogs["<b>Book information services</b><br/>Metadata and cover information"]:::external
+  timer["<b>Optional time-tracking service</b><br/>One selected app · reading activity synchronization"]:::external
+
+  people -->|"HTTPS"| delivery
+  delivery -->|"application"| browser
+  delivery -->|"published profile request"| publicrenderer
+  browser -->|"cache and queued work"| local
+
+  browser -->|"sign in"| identity
+  browser -->|"owner reads and writes"| permissions
+  permissions -->|"allow or reject"| appdata
+  browser -->|"authenticated requests"| apis
+
+  publicrenderer -->|"published projection only"| appdata
+  apis -->|"privileged application access"| appdata
+  configuration -. "server-only values" .-> apis
+  apis -->|"book lookup"| catalogs
+  apis -->|"integration requests"| timer
+
+  identity -->|"account lifecycle"| events
+  appdata -->|"data lifecycle"| events
+  events --> workers
+  workers -->|"maintenance"| appdata
+  workers -->|"deferred integration work"| timer
+
+  publicrenderer -.-> observability
+  apis -.-> observability
+  workers -.-> observability

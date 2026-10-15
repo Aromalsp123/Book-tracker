@@ -1,0 +1,41 @@
+{
+  "name": "functions",
+  "scripts": {
+    "test": "npm run lint && npm run build && npm run check:test && node --require ./test/setup.cts --test test/*.test.cts",
+    "check:test": "tsc --noEmit -p tsconfig.test.json",
+    "lint": "eslint --flag unstable_native_nodejs_ts_config \"src/**/*\"",
+    "clean": "node -e \"require('node:fs').rmSync('lib', {recursive: true, force: true})\"",
+    "build": "npm run clean && npm run sync-shared && tsc",
+    "sync-shared": "node -e \"const fs=require('node:fs');fs.rmSync('src/shared',{recursive:true,force:true});fs.cpSync('../shared','src/shared',{recursive:true})\"",
+    "stage:emulator-secrets": "node lib/scripts/stage-emulator-secrets.js",
+    "serve": "npm run build && node lib/scripts/stage-emulator-secrets.js && npm exec --yes --package firebase-tools@15.24.0 -- firebase emulators:start --only auth,firestore,functions",
+    "shell": "npm run serve",
+    "start": "npm run serve",
+    "deploy": "npm exec --yes --package firebase-tools@15.24.0 -- firebase deploy --only functions",
+    "logs": "npm exec --yes --package firebase-tools@15.24.0 -- firebase functions:log"
+  },
+  "engines": {
+    "node": "22"
+  },
+  "main": "lib/index.js",
+  "dependencies": {
+    "@google-cloud/firestore": "8.7.0",
+    "@grpc/grpc-js": "1.14.4",
+    "firebase-admin": "14.2.0",
+    "firebase-functions": "7.3.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "22.20.1",
+    "@typescript-eslint/eslint-plugin": "8.65.0",
+    "@typescript-eslint/parser": "8.65.0",
+    "eslint": "10.8.0",
+    "typescript": "5.9.3"
+  },
+  "overrides": {
+    "qs": "6.16.0",
+    "rimraf": "6.1.3",
+    "uuid": "11.1.1"
+  },
+  "private": true
+}

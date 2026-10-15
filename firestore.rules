@@ -1,0 +1,1739 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{userId} {
+      allow read: if request.auth != null && userId == request.auth.uid;
+      // The operator's live catalog console needs every account's tombstone
+      // state to tell orphaned data from a live reader's book.
+      allow list: if isOperator();
+    }
+    match /configuration/timeTracking {
+      allow read: if request.auth != null;
+    }
+    match /users/{userId}/timeTrackingResults/{operationId} {
+      allow read: if request.auth != null && userId == request.auth.uid;
+    }
+    match /users/{userId}/timerOperations/{operationId} {
+      allow read: if request.auth != null && userId == request.auth.uid;
+      allow create: if request.auth != null && userId == request.auth.uid
+                    && verifiedAccount()
+                    && v2Acknowledgement(request.resource.data, operationId)
+                    && v2OperationTransition(userId, request.resource.data.intent);
+    }
+    match /users/{userId}/timeTrackingQueue/{operationId} {
+      allow read: if request.auth != null && userId == request.auth.uid;
+      allow create: if request.auth != null && userId == request.auth.uid
+                    && verifiedAccount()
+                    && v2RowsAvailable(userId)
+                    && v2InitialQueue(request.resource.data, operationId)
+                    && request.resource.data.intent.connection.provider != 'none'
+                    && getAfter(/databases/$(database)/documents/users/$(userId)/timerOperations/$(operationId)).data.intent == request.resource.data.intent
+                    && !exists(/databases/$(database)/documents/users/$(userId)/timerOperations/$(operationId));
+    }
+    function v2RowsAvailable(userId) {
+      let path = /databases/$(database)/documents/users/$(userId)/functionQuotas/timeTrackingQueueRows;
+      return !exists(path) || get(path).data.windowStartedAt <= request.time - duration.value(3600,'s') || get(path).data.count < 60;
+    }
+    function v2Id(id) {
+      return id is string && id.matches('[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}');
+    }
+    function v2Intent(intent, operationId) {
+      return intent is map
+             && intent.keys().hasAll(['version','operationId','timerId','bookId','connection','action','start','end','description','remote'])
+             && intent.keys().hasOnly(['version','operationId','timerId','bookId','connection','action','start','end','description','remote'])
+             && intent.version == 2 && intent.operationId == operationId
+             && v2Id(operationId) && v2Id(intent.timerId)
+             && intent.bookId is string && intent.bookId.matches('[^/]{1,500}')
+             && intent.connection is map && intent.connection.provider in ['none','toggl','threeggle']
+             && intent.connection.revision is string
+             && intent.description is string && intent.description.size() > 0 && intent.description.size() <= 2000
+             && validTimerStart(intent.start)
+             && ((intent.action == 'start' && intent.end == null && intent.remote == null)
+                 || (intent.action in ['stop','clear'] && (intent.action == 'clear' || (validTimerStart(intent.end)))));
+    }
+    function v2Acknowledgement(ack, operationId) {
+      return ack.keys().hasAll(['version','operationId','timerId','bookId','action','acceptedAt','intent'])
+             && ack.keys().hasOnly(['version','operationId','timerId','bookId','action','acceptedAt','intent'])
+             && ack.version == 2 && ack.operationId == operationId
+             && ack.timerId == ack.intent.timerId && ack.bookId == ack.intent.bookId
+             && ack.action == ack.intent.action && ack.acceptedAt is int
+             && v2Intent(ack.intent, operationId);
+    }
+    function v2InitialQueue(row, operationId) {
+      return row.keys().hasAll(['version','intent','status','createdAt','attempts','claimedAt','retryAt','prepared','errorCode','successorId','resolution','rowCounted'])
+             && row.keys().hasOnly(['version','intent','status','createdAt','attempts','claimedAt','retryAt','prepared','errorCode','successorId','resolution','rowCounted'])
+             && row.version == 2 && row.status == 'pending' && row.attempts == 0
+             && row.createdAt is int && row.claimedAt == null && row.retryAt == null
+             && row.rowCounted == false && row.prepared == null && row.errorCode == null && row.successorId == null && row.resolution == null
+             && row.intent.action == 'stop' && v2Intent(row.intent,operationId);
+    }
+    function v2Selected(userId, connection) {
+      let user = get(/databases/$(database)/documents/users/$(userId)).data;
+      return user.get('deletedAt', null) == null
+             && (user.get('timeTracking', null) == connection
+                 || (!user.keys().hasAny(['timeTracking']) && connection.revision == 'legacy'
+                     && ((connection.provider == 'none' && !user.keys().hasAny(['toggl']))
+                         || (connection.provider == 'toggl' && connection.accountId == 'legacy'
+                             && connection.workspaceId == user.toggl.workspaceId && connection.projectId == user.toggl.projectId))));
+    }
+    function v2StartsEnabled(connection) {
+      let controls = get(/databases/$(database)/documents/configuration/timeTracking).data;
+      return controls.timerWriteVersion == 2
+             && (connection.provider != 'threeggle' || controls.threeggleEnabled == true);
+    }
+    function v2LocalTimer(timer, intent) {
+      return timer == {'version':2,'timerId':intent.timerId,'operationId':intent.operationId,
+                      'connection':intent.connection,'state':'local','start':intent.start,
+                      'claimedAt':timer.claimedAt,'remote':null,'queueId':null,'errorCode':null}
+             && timer.claimedAt is int;
+    }
+    function v2ActiveClaim(claim, bookId, timer) {
+      return claim == {'version':2,'state':'active','bookId':bookId,'timer':timer};
+    }
+    function v2ClearedClaim(claim, intent) {
+      return claim == {'version':2,'state':'idle','cleared':{'bookId':intent.bookId,'timerId':intent.timerId,'operationId':intent.operationId}};
+    }
+    function v2StartTransition(intent, before, after, beforeClaim, afterClaim) {
+      return intent.action == 'start' && before == null && beforeClaim.state == 'idle'
+             && v2StartsEnabled(intent.connection) && v2LocalTimer(after,intent)
+             && v2ActiveClaim(afterClaim,intent.bookId,after);
+    }
+    function v2StopTransition(userId, intent, before, after, beforeClaim, afterClaim) {
+      return intent.action in ['stop','clear'] && before is map && before.version == 2
+             && before.timerId == intent.timerId && before.start == intent.start
+             && before.connection == intent.connection && before.remote == intent.remote
+             && v2ActiveClaim(beforeClaim,intent.bookId,before)
+             && ((before.state == 'local' && after == null && v2ClearedClaim(afterClaim,intent))
+                 || (intent.action == 'stop' && before.state == 'remote' && before.remote != null
+                     && after.diff(before).affectedKeys().hasOnly(['state','operationId','queueId','errorCode'])
+                     && after.state == 'stopping' && after.operationId == intent.operationId
+                     && after.queueId == intent.operationId && after.errorCode == null
+                     && v2ActiveClaim(afterClaim,intent.bookId,after)))
+             && (intent.action == 'clear' || intent.connection.provider == 'none'
+                 || v2QueuedIntent(userId,intent));
+    }
+    function v2QueuedIntent(userId, intent) {
+      let row = getAfter(/databases/$(database)/documents/users/$(userId)/timeTrackingQueue/$(intent.operationId)).data;
+      return row.intent == intent
+             && !exists(/databases/$(database)/documents/users/$(userId)/timeTrackingQueue/$(intent.operationId));
+    }
+    function v2OperationTransition(userId, intent) {
+      let bookPath = /databases/$(database)/documents/users/$(userId)/books/$(intent.bookId);
+      let claimPath = /databases/$(database)/documents/users/$(userId)/timerLifecycle/current;
+      let before = get(bookPath).data.get('activeTimer', null);
+      let after = getAfter(bookPath).data.get('activeTimer', null);
+      let beforeClaim = get(claimPath).data;
+      let afterClaim = getAfter(claimPath).data;
+      return v2Selected(userId,intent.connection)
+             && intent.description == get(bookPath).data.title
+             && (v2StartTransition(intent,before,after,beforeClaim,afterClaim)
+                 || v2StopTransition(userId,intent,before,after,beforeClaim,afterClaim));
+    }
+    function v2BookTransition(userId, bookId, afterClaim) {
+      let operationId = afterClaim.state == 'active' ? afterClaim.timer.operationId : afterClaim.cleared.operationId;
+      let ackPath = /databases/$(database)/documents/users/$(userId)/timerOperations/$(operationId);
+      let ack = getAfter(ackPath).data;
+      // A previously absent acknowledgement must be created in this batch.
+      // Its create rule validates the full book/claim/queue transition once.
+      return !exists(ackPath) && ack.bookId == bookId && ack.operationId == operationId;
+    }
+    function v2ClaimTransition(userId) {
+      let after = request.resource.data;
+      let bookId = after.state == 'active' ? after.bookId : after.cleared.bookId;
+      return after.version == 2 && v2BookTransition(userId,bookId,after);
+    }
+    function legacyStartAllowed(userId) {
+      // Old local starts cannot pin an explicitly configured revision.
+      // Readers remain compatible, while those stale writers must refresh.
+      let path = /databases/$(database)/documents/users/$(userId);
+      return !exists(path) || !get(path).data.keys().hasAny(['timeTracking']);
+    }
+
+    // Own-user private data, but a signed-up stranger's too: every field a
+    // client may write is allowlisted and byte-capped (SEC-039), so one
+    // document is a few KB rather than the 1 MiB Firestore allows —
+    // storage that PITR and 98 daily backups would multiply, and that a
+    // delete event would carry in full into Pub/Sub (SEC-071). Progress and
+    // timer updates only touch fields the transition rules already pin, so
+    // they skip the shape check: the timer batch runs close to the rules
+    // expression budget and must stay cheap.
+    match /users/{userId}/books/{bookId} {
+      allow read: if request.auth != null && userId == request.auth.uid;
+      allow get: if isOperator();
+      allow create: if request.auth != null && userId == request.auth.uid
+                    && validBookTitle()
+                    && validInitialBookTimer()
+                    && validBookPageState(request.resource.data)
+                    && request.resource.data.get('currentPageUpdateId', null) == null
+                    && request.resource.data.get('lastReadAt', null) == null
+                    && validBookShape()
+                    && validBookAuthors()
+                    && validBookCatalogLink();
+      allow update: if request.auth != null && userId == request.auth.uid
+                    && validBookTitle()
+                    && validBookTimerTransition(userId, bookId)
+                    && validBookPageStateTransition()
+                    && validBookProgressSourceTransition(userId, bookId)
+                    && ((request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                           'activeTimer', 'currentPage', 'currentPageUpdateId',
+                           'pagesRead', 'timeRead', 'finished', 'finishedAt', 'lastReadAt', 'updatedAt'
+                         ])
+                         && validBookProgressFields())
+                        || (validBookShape()
+                            && request.resource.data.get('createdAt', null) == resource.data.get('createdAt', null)
+                            && bookLastReadAtUnchanged()
+                            && validBookAuthorsTransition()
+                            && validBookCatalogLinkTransition()));
+      // A local timer has no remote side effect. The UI explicitly warns
+      // that its unsaved interval will be lost. Server-backed and uncertain
+      // Toggl lifecycle states must be cleared through their stop/resolve path.
+      allow delete: if request.auth != null && userId == request.auth.uid
+                    && (resource.data.get('activeTimer', null) == null
+                        || (validLocalTimer(resource.data.activeTimer)
+                            && validDeletedLocalTimerClaim(userId, bookId)));
+
+      // Writes are validated so a client cannot forge owner — which the
+      // collectionGroup rule below trusts for cross-book stats reads — nor
+      // point book at another document or invent an unknown type.
+      match /updates/{updateId} {
+        allow read: if request.auth != null && userId == request.auth.uid;
+        allow create: if request.auth != null && userId == request.auth.uid
+                      && validBookUpdateIdentity(userId, bookId)
+                      && validNewBookUpdateShape()
+                      && validCreatedBookUpdate(userId, bookId, updateId);
+        allow update: if request.auth != null && userId == request.auth.uid
+                      && validBookUpdateIdentity(userId, bookId)
+                      && resource.data.type == 'reading'
+                      && request.resource.data.type == resource.data.type
+                      && validChangedReadingShape()
+                      && validChangedBookUpdate(userId, bookId, updateId);
+        allow delete: if request.auth != null && userId == request.auth.uid
+                      && resource.data.type == 'reading'
+                      && validDeletedBookUpdate(userId, bookId, updateId);
+      }
+    }
+
+    // Sharing is on by default (owner decision 2026-09-01); this setting
+    // records an opt-out and the reader's time zone. It lives outside the
+    // cached profile document: older clients replace profiles wholesale, so
+    // a switch stored there could be erased by an unrelated stats sync.
+    // Only the owner can read it. Deleting it returns to the default (on).
+    match /users/{userId}/settings/{settingId} {
+      allow get: if request.auth != null
+                 && userId == request.auth.uid
+                 && settingId == 'bookSharing';
+      allow create: if request.auth != null
+                    && userId == request.auth.uid
+                    && settingId == 'bookSharing'
+                    && validBookSharingSetting(userId);
+      allow update: if request.auth != null
+                    && userId == request.auth.uid
+                    && settingId == 'bookSharing'
+                    && request.resource.data.createdAt == resource.data.createdAt
+                    && validBookSharingSetting(userId);
+      allow delete: if request.auth != null
+                    && userId == request.auth.uid
+                    && settingId == 'bookSharing';
+    }
+
+    // The to-read plan (docs/to-read-plan.md): private queue rows and the
+    // reader's daily-minutes scenario. Owner-only, the same posture as the
+    // books they order (no tombstone gate: a soft-deleted account keeps
+    // its personal content, SEC-006). A 'planned' row is an intention with
+    // its own bibliographic fields; a 'book' row is the saved position of
+    // the personal book sharing its id. Start reading converts planned to
+    // book in the batch that creates that book, and only then, so a replay
+    // cannot create a second book. A replay after the conversion would
+    // pass as an ordinary book-row update, so the books rule pins
+    // createdAt: a second set over the started book is refused and takes
+    // the batch with it. Catalog fields on a planned row are
+    // advisory copies; the book create validates the link when it lands.
+    match /users/{userId}/readingPlanEntries/{entryId} {
+      allow read: if request.auth != null && userId == request.auth.uid;
+      allow create: if request.auth != null && userId == request.auth.uid
+                    && validPlanEntryBase(request.resource.data)
+                    && ((request.resource.data.kind == 'planned'
+                         && validPlannedEntryFields(request.resource.data))
+                        || (request.resource.data.kind == 'book'
+                            && validBookEntryFields(request.resource.data)
+                            && existsAfter(/databases/$(database)/documents/users/$(userId)/books/$(entryId))));
+      allow update: if request.auth != null && userId == request.auth.uid
+                    && validPlanEntryBase(request.resource.data)
+                    && request.resource.data.createdAt == resource.data.createdAt
+                    && ((resource.data.kind == 'planned'
+                         && request.resource.data.kind == 'planned'
+                         && validPlannedEntryFields(request.resource.data))
+                        || (resource.data.kind == 'book'
+                            && request.resource.data.kind == 'book'
+                            && validBookEntryFields(request.resource.data))
+                        || (resource.data.kind == 'planned'
+                            && request.resource.data.kind == 'book'
+                            && validBookEntryFields(request.resource.data)
+                            && !exists(/databases/$(database)/documents/users/$(userId)/books/$(entryId))
+                            && existsAfter(/databases/$(database)/documents/users/$(userId)/books/$(entryId))));
+      // Only an intention can be removed. A row that became a book in
+      // another tab keeps its rank and estimate while that book exists.
+      allow delete: if request.auth != null && userId == request.auth.uid
+                    && (resource.data.kind == 'planned'
+                        || !exists(/databases/$(database)/documents/users/$(userId)/books/$(entryId)));
+    }
+
+    match /users/{userId}/readingPlans/{planId} {
+      allow get: if request.auth != null && userId == request.auth.uid && planId == 'default';
+      allow create, update: if request.auth != null && userId == request.auth.uid
+                            && planId == 'default'
+                            && validReadingPlanSettings(request.resource.data);
+      allow delete: if request.auth != null && userId == request.auth.uid && planId == 'default';
+    }
+
+    function validPlanEntryBase(entry) {
+      return entry.kind in ['planned', 'book']
+             && entry.rank is number
+             && entry.rank >= -1000000000000000
+             && entry.rank <= 1000000000000000
+             && (entry.manualMinutesPerPage == null
+                 || (entry.manualMinutesPerPage is number
+                     && entry.manualMinutesPerPage > 0
+                     && entry.manualMinutesPerPage <= 1000))
+             && entry.createdAt is timestamp
+             && entry.updatedAt is timestamp;
+    }
+
+    function validBookEntryFields(entry) {
+      return entry.keys().hasAll(['kind', 'rank', 'manualMinutesPerPage', 'createdAt', 'updatedAt'])
+             && entry.keys().hasOnly(['kind', 'rank', 'manualMinutesPerPage', 'createdAt', 'updatedAt']);
+    }
+
+    function validPlannedEntryFields(entry) {
+      return entry.keys().hasAll([
+               'kind', 'rank', 'manualMinutesPerPage', 'createdAt', 'updatedAt',
+               'title', 'authors', 'pageCount', 'isbn', 'coverUrl', 'publisher',
+               'publishedDate', 'subjects', 'fiction', 'language',
+               'workId', 'editionId', 'matchMethod'
+             ])
+             && entry.keys().hasOnly([
+               'kind', 'rank', 'manualMinutesPerPage', 'createdAt', 'updatedAt',
+               'title', 'authors', 'pageCount', 'isbn', 'coverUrl', 'publisher',
+               'publishedDate', 'subjects', 'fiction', 'language',
+               'workId', 'editionId', 'matchMethod'
+             ])
+             && entry.title is string
+             && entry.title.size() > 0
+             && entry.title.size() <= 500
+             && entry.authors is list
+             && entry.authors.size() <= 6
+             && validPlannedAuthorAt(entry.authors, 0)
+             && validPlannedAuthorAt(entry.authors, 1)
+             && validPlannedAuthorAt(entry.authors, 2)
+             && validPlannedAuthorAt(entry.authors, 3)
+             && validPlannedAuthorAt(entry.authors, 4)
+             && validPlannedAuthorAt(entry.authors, 5)
+             && (entry.pageCount == null
+                 || (entry.pageCount is int
+                     && entry.pageCount > 0
+                     && entry.pageCount <= 9007199254740991))
+             && entry.isbn is string
+             && entry.isbn.size() <= 32
+             && entry.coverUrl is string
+             && entry.coverUrl.size() <= 2048
+             && entry.publisher is string
+             && entry.publisher.size() <= 500
+             && entry.publishedDate is string
+             && entry.publishedDate.size() <= 64
+             && entry.subjects is list
+             && entry.subjects.size() <= 25
+             && entry.subjects.join('').size() <= 2500
+             && (entry.fiction == null || entry.fiction is bool)
+             && entry.language is string
+             && entry.language.size() <= 16
+             && ((entry.workId == null
+                  && entry.editionId == null
+                  && entry.matchMethod == null)
+                 || (entry.workId is string
+                     && entry.workId.matches('[^/]{1,100}')
+                     && entry.matchMethod in ['isbn', 'external-id', 'catalog-choice']
+                     && (entry.editionId == null
+                         || (entry.editionId is string
+                             && entry.editionId.matches('[^/]{1,100}')))));
+    }
+
+    function validPlannedAuthorAt(authors, index) {
+      return authors.size() <= index
+             || (authors[index] is map
+                 && authors[index].keys().hasAll(['id', 'name'])
+                 && authors[index].keys().hasOnly(['id', 'name'])
+                 && (authors[index].id == null
+                     || (authors[index].id is string
+                         && authors[index].id.matches('[^/]{1,100}')))
+                 && authors[index].name is string
+                 && authors[index].name.size() > 0
+                 && authors[index].name.size() <= 200);
+    }
+
+    function validReadingPlanSettings(settings) {
+      return settings.keys().hasAll(['dailyMinutesOverride', 'updatedAt'])
+             && settings.keys().hasOnly(['dailyMinutesOverride', 'updatedAt'])
+             && (settings.dailyMinutesOverride == null
+                 || (settings.dailyMinutesOverride is number
+                     && settings.dailyMinutesOverride > 0
+                     && settings.dailyMinutesOverride <= 1440))
+             && settings.updatedAt is timestamp;
+    }
+
+    function validBookSharingSetting(userId) {
+      let setting = request.resource.data;
+      return userId == request.auth.uid
+             && setting.keys().hasAll(['enabled', 'timeZone', 'createdAt', 'updatedAt'])
+             && setting.keys().hasOnly(['enabled', 'timeZone', 'createdAt', 'updatedAt'])
+             && setting.enabled is bool
+             && setting.timeZone is string
+             && setting.timeZone.matches('[A-Za-z0-9_+./-]{1,100}')
+             && setting.createdAt is timestamp
+             && setting.updatedAt is timestamp;
+    }
+
+    // Rollout compatibility (shared-catalog migration, MIGRATIONS.md): a
+    // client bundle cached by the service worker from before the catalog
+    // release still listens to its per-user author list. Reads stay open so
+    // that tab degrades to stale author names rather than a listener error;
+    // writes are gone — the migration has moved every reference to
+    // catalogAuthors, and a book written by that old bundle is refused by
+    // validBookAuthors. The block and the documents it guards stay until the
+    // owner explicitly asks for the legacy per-user author documents to be
+    // moved or removed; nothing here schedules their deletion.
+    match /users/{userId}/authors/{authorId} {
+      allow read: if request.auth != null && userId == request.auth.uid;
+    }
+
+    // Catalog documents are server-owned. Works and editions stay behind
+    // bounded search callables. Authors are the one shared list used by
+    // every personal book, so signed-in clients may read and autocomplete
+    // active names and retain merged redirects for cached book references.
+    //
+    // The operator's browser is the exception: the catalog console listens
+    // to every catalog collection (works and editions in every status, the
+    // identifier indexes, every account's books) and runs the scan locally
+    // (shared/catalogScan.ts), so the console is live and costs only the
+    // documents that change. The gate is the one the admin callables apply
+    // (isOperator). Bibliographic data is public whoever seeded it; who read
+    // what stays behind the owner rules for everyone else (owner decision
+    // 2026-09-01).
+    match /works/{workId} {
+      allow get: if request.auth != null
+                 && resource.data.status == 'active';
+      allow read: if isOperator();
+    }
+
+    match /catalogAuthors/{authorId} {
+      allow read: if request.auth != null && verifiedAccount();
+    }
+
+    match /editions/{editionId} {
+      allow get: if request.auth != null
+                 && resource.data.workId is string
+                 && get(/databases/$(database)/documents/works/$(resource.data.workId)).data.status == 'active';
+      allow read: if isOperator();
+    }
+
+    match /isbnIndex/{isbn13} {
+      allow read: if isOperator();
+    }
+
+    match /externalIdIndex/{indexId} {
+      allow read: if isOperator();
+    }
+
+    match /users/{userId}/timerLifecycle/{lifecycleId} {
+      allow read: if request.auth != null && userId == request.auth.uid
+                  && lifecycleId == 'current';
+      allow update: if request.auth != null && userId == request.auth.uid
+                    && lifecycleId == 'current'
+                    && (request.resource.data.get("version", 1) == 2 ? v2ClaimTransition(userId) : validClientTimerClaimTransition(userId));
+    }
+
+    // The fields a progress or timer update may touch without the full
+    // shape check are typed here, cheaply (get() with a default rather than
+    // hasAny branches: this runs inside every timer batch, and the tightest
+    // of them — the outcome-unknown clear — sits nearest the expression
+    // budget). Page state types currentPage/pageCount/finished, the timer
+    // transition types activeTimer, and the progress-source transition pins
+    // currentPageUpdateId to an existing document id.
+    function validBookProgressFields() {
+      let book = request.resource.data;
+      return book.get('updatedAt', request.time) is timestamp
+             && book.get('pagesRead', 0) is number
+             && book.get('timeRead', 0) is number
+             && validBookFinishedAt(book)
+             && validBookLastReadAt(book);
+    }
+
+    // lastReadAt is the moment of the book's newest reading activity and
+    // what the reading list orders by (utils/lastRead.ts). Reading and
+    // editing are separate kinds of change: only a progress batch may move
+    // it, a metadata edit must leave it exactly as stored, and a new book
+    // has not been read. Null or absent means never read.
+    function validBookLastReadAt(book) {
+      return book.get('lastReadAt', null) == null
+             || book.lastReadAt is timestamp;
+    }
+
+    function bookLastReadAtUnchanged() {
+      return request.resource.data.get('lastReadAt', null)
+             == resource.data.get('lastReadAt', null);
+    }
+
+    // finishedAt is the moment the book was marked finished, and the only
+    // finish date the app reads (updatedAt moves on every metadata edit).
+    // A finished book carries a timestamp, an unfinished one null or
+    // nothing. The client stamps it in the same batch that flips finished;
+    // migrate-finished-at.ts backfilled every book finished before the
+    // field existed, so a finished book without one is refused rather
+    // than tolerated.
+    function validBookFinishedAt(book) {
+      return book.get('finished', false) == true
+             ? book.get('finishedAt', null) is timestamp
+             : book.get('finishedAt', null) == null;
+    }
+
+    // Field allowlist and byte caps for a book document (SEC-039). Lists
+    // cannot be iterated in rules, so string lists are bounded through
+    // join(): it throws on a non-string element, which is a denial.
+    // size() counts UTF-16 code units, so a cap is up to three times as
+    // many bytes for CJK text — still tens of KB per document, not the
+    // 1 MiB Firestore allows. The pre-migration author/authors fields are
+    // not admitted: no live document carries them (inventoried 2026-08-29)
+    // and the client only ever deletes them, so an update that still holds
+    // one must shed it — an uncapped list of maps was a 1 MiB channel.
+    function validBookShape() {
+      let book = request.resource.data;
+      return book.keys().hasOnly([
+               'activeTimer', 'authorIds', 'coverUrl', 'createdAt',
+               'currentPage', 'currentPageUpdateId', 'fiction', 'finished', 'finishedAt', 'isbn',
+               'language', 'lastReadAt', 'workId', 'editionId', 'matchMethod', 'linkedAt',
+               'owner', 'pageCount', 'pagesRead', 'timeRead', 'publishedDate',
+               'publisher', 'subjects', 'title', 'updatedAt'
+             ])
+             // Absent on the oldest documents; typed when present.
+             && book.get('updatedAt', request.time) is timestamp
+             && validBookFinishedAt(book)
+             && validBookLastReadAt(book)
+             // The shape cap stays at the pre-catalog 50 so a legacy book
+             // the migration left with 7–50 per-user ids (REVIEW
+             // too-many-personal-authors) can still have its title, page
+             // count or ISBN corrected; the six-author cap is enforced by
+             // validBookAuthors whenever authorIds itself changes.
+             && (!book.keys().hasAny(['authorIds'])
+                 || (book.authorIds is list && book.authorIds.size() <= 50
+                     && book.authorIds.toSet().size() == book.authorIds.size()
+                     && book.authorIds.join('').size() <= 5000))
+             && (!book.keys().hasAny(['coverUrl'])
+                 || (book.coverUrl is string && book.coverUrl.size() <= 2048))
+             && (!book.keys().hasAny(['publisher'])
+                 || (book.publisher is string && book.publisher.size() <= 500))
+             && (!book.keys().hasAny(['publishedDate'])
+                 || (book.publishedDate is string && book.publishedDate.size() <= 64))
+             && (!book.keys().hasAny(['subjects'])
+                 || (book.subjects is list && book.subjects.size() <= 25
+                     && book.subjects.join('').size() <= 2500))
+             && (!book.keys().hasAny(['fiction'])
+                 || book.fiction == null || book.fiction is bool)
+             && (!book.keys().hasAny(['language'])
+                 || (book.language is string && book.language.size() <= 16))
+             && (!book.keys().hasAny(['isbn'])
+                 || (book.isbn is string && book.isbn.size() <= 32))
+             && (!book.keys().hasAny(['workId'])
+                 || book.workId == null
+                 || (book.workId is string && book.workId.matches('[^/]{1,100}')))
+             && (!book.keys().hasAny(['editionId'])
+                 || book.editionId == null
+                 || (book.editionId is string && book.editionId.matches('[^/]{1,100}')))
+             && (!book.keys().hasAny(['matchMethod'])
+                 || book.matchMethod == null
+                 || book.matchMethod in ['isbn', 'external-id', 'catalog-choice', 'migration', 'admin'])
+             && (!book.keys().hasAny(['linkedAt'])
+                 || book.linkedAt == null || book.linkedAt is timestamp)
+             // Cross-user summaries derive identity from this reference.
+             // Old unlinked books may omit it, but every linked row must pin
+             // it so one malformed record cannot make a work page fail.
+             && (!book.keys().hasAny(['owner'])
+                 ? book.get('workId', null) == null
+                 : book.owner == /databases/$(database)/documents/users/$(request.auth.uid))
+             && (!book.keys().hasAny(['createdAt']) || book.createdAt is timestamp)
+             && (!book.keys().hasAny(['pagesRead'])
+                 || (book.pagesRead is number && book.pagesRead >= 0))
+             && (!book.keys().hasAny(['timeRead'])
+                 || (book.timeRead is number && book.timeRead >= 0))
+             && (book.get('currentPageUpdateId', null) == null
+                 || (book.currentPageUpdateId is string
+                     && book.currentPageUpdateId.size() <= 100));
+    }
+
+    // Personal books accept at most six authors so Rules can prove every
+    // reference exists in the server-owned shared catalog. Merged aliases
+    // remain valid cached references; missing legacy per-user IDs do not.
+    function validBookAuthorsTransition() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(['authorIds'])
+             || validBookAuthors();
+    }
+
+    function validBookAuthors() {
+      let ids = request.resource.data.get('authorIds', []);
+      return ids is list
+             && ids.size() <= 6
+             && ids.toSet().size() == ids.size()
+             && (bookAuthorsCoveredByLinkedWork(ids)
+                 || (validBookAuthorAt(ids, 0)
+                     && validBookAuthorAt(ids, 1)
+                     && validBookAuthorAt(ids, 2)
+                     && validBookAuthorAt(ids, 3)
+                     && validBookAuthorAt(ids, 4)
+                     && validBookAuthorAt(ids, 5)));
+    }
+
+    // A server-owned Work already pins valid shared authors. Reusing that
+    // trust avoids six extra document reads when an edit also links an
+    // edition and writes a page-count correction in the same atomic batch.
+    function bookAuthorsCoveredByLinkedWork(ids) {
+      let workId = request.resource.data.get('workId', null);
+      return workId is string
+             && get(/databases/$(database)/documents/works/$(workId)).data.authorIds is list
+             && get(/databases/$(database)/documents/works/$(workId)).data.authorIds.toSet()
+                  .hasAll(ids.toSet());
+    }
+
+    function validBookAuthorAt(ids, index) {
+      return ids.size() <= index
+             || (ids[index] is string
+                 && ids[index].matches('[^/]{1,100}')
+                 && exists(/databases/$(database)/documents/catalogAuthors/$(ids[index])));
+    }
+
+    // A link changed by the browser may target only an active work. Links
+    // to a hidden work (the admin soft delete) survive because Admin SDK
+    // writes bypass Rules; the browser just cannot create new ones. Later metadata edits skip these reads while
+    // the four link fields remain unchanged, which keeps timer and ordinary
+    // book edits inside the Rules expression and document-access budgets.
+    function validBookCatalogLinkTransition() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+               'workId', 'editionId', 'matchMethod', 'linkedAt'
+             ]) || validBookCatalogLink();
+    }
+
+    function validBookCatalogLink() {
+      let book = request.resource.data;
+      let workId = book.get('workId', null);
+      let editionId = book.get('editionId', null);
+      let method = book.get('matchMethod', null);
+      let linkedAt = book.get('linkedAt', null);
+      return (workId == null
+              && editionId == null
+              && method == null
+              && linkedAt == null)
+             || (workId is string
+                 && workId.matches('[^/]{1,100}')
+                 && method in ['isbn', 'external-id', 'catalog-choice']
+                 && linkedAt is timestamp
+                 && get(/databases/$(database)/documents/works/$(workId)).data.status == 'active'
+                 && (editionId == null
+                     || (editionId is string
+                         && editionId.matches('[^/]{1,100}')
+                         && get(/databases/$(database)/documents/editions/$(editionId)).data.workId == workId)));
+    }
+
+    function validBookUpdateIdentity(userId, bookId) {
+      return request.resource.data.owner == /databases/$(database)/documents/users/$(userId)
+             && request.resource.data.book == /databases/$(database)/documents/users/$(userId)/books/$(bookId)
+             && request.resource.data.type in ['reading', 'update'];
+    }
+
+    function validNewBookUpdateShape() {
+      let entry = request.resource.data;
+      return ((entry.type == 'reading'
+               && entry.keys().hasAll([
+                 'owner', 'book', 'type', 'timeRead', 'fromPage', 'toPage',
+                 'pagesRead', 'updatedAt', 'createdAt'
+               ])
+               && entry.keys().hasOnly([
+                 'owner', 'book', 'type', 'timeRead', 'fromPage', 'toPage',
+                 'pagesRead', 'updatedAt', 'createdAt'
+               ])
+               && entry.timeRead is int
+               && entry.timeRead > 0
+               && entry.pagesRead >= 0
+               && entry.toPage >= entry.fromPage)
+              || (entry.type == 'update'
+                  && entry.keys().hasAll([
+                    'owner', 'book', 'type', 'fromPage', 'toPage', 'pagesRead',
+                    'updatedAt', 'createdAt'
+                  ])
+                  && entry.keys().hasOnly([
+                    'owner', 'book', 'type', 'fromPage', 'toPage', 'pagesRead',
+                    'updatedAt', 'createdAt'
+                  ])))
+             && entry.fromPage is int
+             && entry.fromPage >= 0
+             && entry.fromPage <= 9007199254740991
+             && entry.toPage is int
+             && entry.toPage >= 0
+             && entry.toPage <= 9007199254740991
+             && entry.pagesRead is int
+             && entry.pagesRead >= -9007199254740991
+             && entry.pagesRead <= 9007199254740991
+             && entry.pagesRead == entry.toPage - entry.fromPage
+             && entry.updatedAt is timestamp
+             && entry.createdAt is timestamp;
+    }
+
+    function validChangedReadingShape() {
+      let before = resource.data;
+      let after = request.resource.data;
+      return after.keys().hasAll([
+               'owner', 'book', 'type', 'timeRead', 'fromPage', 'toPage',
+               'pagesRead', 'updatedAt', 'createdAt'
+             ])
+             && after.keys().hasOnly([
+               'owner', 'book', 'type', 'timeRead', 'fromPage', 'toPage',
+               'pagesRead', 'updatedAt', 'createdAt'
+             ])
+             && after.diff(before).affectedKeys().hasOnly([
+               'timeRead', 'toPage', 'pagesRead', 'updatedAt'
+             ])
+             && after.owner == before.owner
+             && after.book == before.book
+             && after.type == before.type
+             && after.createdAt == before.createdAt
+             && after.fromPage == before.fromPage
+             && after.fromPage is int
+             && after.fromPage >= 0
+             && after.fromPage <= 9007199254740991
+             && after.toPage is int
+             && after.toPage > after.fromPage
+             && after.toPage <= 9007199254740991
+             && after.pagesRead is int
+             && after.pagesRead >= 0
+             && after.pagesRead <= 9007199254740991
+             && after.pagesRead == after.toPage - after.fromPage
+             && after.timeRead is int
+             && after.timeRead > 0
+             && after.updatedAt is timestamp;
+    }
+
+    // Every update row and its denormalized book aggregates move in one
+    // batch. getAfter makes a stale offline edit fail atomically after a
+    // different client has already changed the same session, while increment
+    // transforms from edits to different sessions continue to commute.
+    function validCreatedBookUpdate(userId, bookId, updateId) {
+      let before = get(/databases/$(database)/documents/users/$(userId)/books/$(bookId)).data;
+      let after = getAfter(/databases/$(database)/documents/users/$(userId)/books/$(bookId)).data;
+      let entry = request.resource.data;
+      return ((entry.type == 'reading'
+               && after.get('pagesRead', 0) == before.get('pagesRead', 0) + entry.pagesRead
+               && after.get('timeRead', 0) == before.get('timeRead', 0) + entry.timeRead)
+              || (entry.type == 'update'
+                  && after.get('pagesRead', 0) == before.get('pagesRead', 0)
+                  && after.get('timeRead', 0) == before.get('timeRead', 0)))
+             && entry.fromPage == before.currentPage
+             && after.currentPage == entry.toPage
+             && ((before.keys().hasAny(['currentPageUpdateId'])
+                  && after.currentPageUpdateId == updateId)
+                 || (!before.keys().hasAny(['currentPageUpdateId'])
+                     && (after.get('currentPageUpdateId', null) == null
+                         || after.currentPageUpdateId == updateId)))
+             && (validCorrelatedBook(before, after)
+                 || (entry.type == 'update'
+                     && validPageCountClampBook(before, after, entry)));
+    }
+
+    function validChangedBookUpdate(userId, bookId, updateId) {
+      let before = get(/databases/$(database)/documents/users/$(userId)/books/$(bookId)).data;
+      let after = getAfter(/databases/$(database)/documents/users/$(userId)/books/$(bookId)).data;
+      let oldEntry = resource.data;
+      let newEntry = request.resource.data;
+      return after.get('pagesRead', 0) == before.get('pagesRead', 0) + newEntry.pagesRead - oldEntry.pagesRead
+             && after.get('timeRead', 0) == before.get('timeRead', 0) + newEntry.timeRead - oldEntry.timeRead
+             && ((before.get('currentPageUpdateId', null) == updateId
+                  && after.currentPage == newEntry.toPage
+                  && after.currentPageUpdateId == updateId)
+                 || (before.get('currentPageUpdateId', null) != updateId
+                     && after.currentPage == before.currentPage
+                     && after.get('currentPageUpdateId', null)
+                        == before.get('currentPageUpdateId', null)))
+             && newEntry.toPage <= after.pageCount
+             && validCorrelatedBook(before, after);
+    }
+
+    function validDeletedBookUpdate(userId, bookId, updateId) {
+      let before = get(/databases/$(database)/documents/users/$(userId)/books/$(bookId)).data;
+      let after = getAfter(/databases/$(database)/documents/users/$(userId)/books/$(bookId)).data;
+      let entry = resource.data;
+      return after.get('pagesRead', 0) == before.get('pagesRead', 0) - entry.pagesRead
+             && after.get('timeRead', 0) == before.get('timeRead', 0) - entry.timeRead
+             && ((before.get('currentPageUpdateId', null) == updateId
+                  && after.currentPage == entry.fromPage
+                  && (after.get('currentPageUpdateId', null) == null
+                      || validSurvivingProgressSource(
+                           userId, bookId, updateId,
+                           after.get('currentPageUpdateId', null), after.currentPage
+                         )))
+                 || (before.get('currentPageUpdateId', null) != updateId
+                     && after.currentPage == before.currentPage
+                     && after.get('currentPageUpdateId', null)
+                        == before.get('currentPageUpdateId', null)))
+             && validCorrelatedBook(before, after);
+    }
+
+    function validSurvivingProgressSource(userId, bookId, deletedId, sourceId, page) {
+      return sourceId is string
+             && sourceId != deletedId
+             && existsAfter(/databases/$(database)/documents/users/$(userId)/books/$(bookId)/updates/$(sourceId))
+             && getAfter(/databases/$(database)/documents/users/$(userId)/books/$(bookId)/updates/$(sourceId)).data.toPage
+                == page;
+    }
+
+    function validCorrelatedBook(before, after) {
+      let pagesRead = after.get('pagesRead', 0);
+      let timeRead = after.get('timeRead', 0);
+      return after.diff(before).affectedKeys().hasOnly([
+               'pagesRead', 'timeRead', 'currentPage', 'currentPageUpdateId',
+               'finished', 'finishedAt', 'lastReadAt', 'updatedAt'
+             ])
+             && validBookLastReadAt(after)
+             && pagesRead is int
+             && pagesRead >= 0
+             && timeRead is int
+             && timeRead >= 0
+             && after.currentPage is int
+             && after.currentPage >= 0
+             && after.currentPage <= 9007199254740991
+             && after.pageCount is int
+             && after.pageCount > 0
+             && after.pageCount <= 9007199254740991
+             && after.currentPage <= after.pageCount
+             && after.get('finished', after.currentPage == after.pageCount)
+                == (after.currentPage == after.pageCount)
+             && (after.get('currentPageUpdateId', null) == null
+                 || after.currentPageUpdateId is string)
+             && after.updatedAt is timestamp;
+    }
+
+    // Editing metadata may shrink pageCount below the rendered currentPage,
+    // or encounter a legacy book whose page is already beyond its count. The
+    // client records that repair as a page-correction row, and the common
+    // create checks above pin entry.fromPage to the server's current page.
+    // That makes an offline stale repair reject atomically after a newer read.
+    function validPageCountClampBook(before, after, entry) {
+      return after.diff(before).affectedKeys().hasOnly([
+               'authorIds', 'author', 'authors', 'title', 'pageCount',
+               'currentPage', 'currentPageUpdateId', 'finished', 'finishedAt', 'isbn',
+               'coverUrl', 'publisher', 'publishedDate', 'subjects',
+               'fiction', 'workId', 'editionId', 'matchMethod', 'linkedAt',
+               'updatedAt'
+             ])
+             && after.pageCount is int
+             && after.pageCount > 0
+             && after.pageCount <= 9007199254740991
+             && before.currentPage > after.pageCount
+             && after.currentPage == after.pageCount
+             && entry.toPage == after.pageCount
+             && after.finished == true
+             && after.updatedAt is timestamp;
+    }
+
+    // The callable owns Toggl lifecycle maps. Clients may start/stop a
+    // local timer, clear a confirmed unknown outcome, or clear an ordinary
+    // remote timer while queuing its offline stop. They cannot forge or
+    // erase a start claim while the server may be issuing the remote POST.
+    function validInitialBookTimer() {
+      let timer = request.resource.data.get('activeTimer', null);
+      return timer == null;
+    }
+
+    function validBookProgressSourceTransition(userId, bookId) {
+      let beforeHasSource = resource.data.keys().hasAny(['currentPageUpdateId']);
+      let beforePage = resource.data.get('currentPage', null);
+      let afterPage = request.resource.data.get('currentPage', null);
+      let beforeSource = resource.data.get('currentPageUpdateId', null);
+      let afterSource = request.resource.data.get('currentPageUpdateId', null);
+      return (afterPage == beforePage
+              && afterSource == beforeSource)
+             || (afterSource is string
+                 && existsAfter(/databases/$(database)/documents/users/$(userId)/books/$(bookId)/updates/$(afterSource))
+                 && getAfter(/databases/$(database)/documents/users/$(userId)/books/$(bookId)/updates/$(afterSource)).data.toPage
+                    == afterPage
+                 && (!exists(/databases/$(database)/documents/users/$(userId)/books/$(bookId)/updates/$(afterSource))
+                     || (afterSource == beforeSource
+                         && getAfter(/databases/$(database)/documents/users/$(userId)/books/$(bookId)/updates/$(afterSource)).data
+                            != get(/databases/$(database)/documents/users/$(userId)/books/$(bookId)/updates/$(afterSource)).data)))
+             || (beforeSource is string
+                 && !existsAfter(/databases/$(database)/documents/users/$(userId)/books/$(bookId)/updates/$(beforeSource))
+                 && get(/databases/$(database)/documents/users/$(userId)/books/$(bookId)/updates/$(beforeSource)).data.fromPage
+                    == afterPage
+                 && (afterSource == null
+                     || validSurvivingProgressSource(
+                          userId, bookId, beforeSource, afterSource, afterPage
+                        )))
+             // Old cached clients know nothing about the source field. Keep
+             // them working only for genuinely legacy books where the field
+             // is absent; explicit-null new books require a source on their
+             // first progress write.
+             || (!beforeHasSource && beforeSource == null && afterSource == null);
+    }
+
+    // Unrelated edits remain possible on old partial documents. Creating or
+    // changing page state, however, must leave one complete, JS-safe state.
+    function validBookPageStateTransition() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+               'currentPage', 'pageCount', 'finished'
+             ])
+             || validBookPageState(request.resource.data);
+    }
+
+    function validBookPageState(book) {
+      return book.keys().hasAll([
+               'currentPage', 'pageCount', 'finished', 'updatedAt'
+             ])
+             && book.currentPage is int
+             && book.currentPage >= 0
+             && book.currentPage <= 9007199254740991
+             && book.pageCount is int
+             && book.pageCount > 0
+             && book.pageCount <= 9007199254740991
+             && book.currentPage <= book.pageCount
+             && book.finished == (book.currentPage == book.pageCount)
+             && book.updatedAt is timestamp;
+    }
+
+    function validBookTitle() {
+      return request.resource.data.title is string
+             && request.resource.data.title.size() > 0
+             && request.resource.data.title.size() <= 500;
+    }
+
+    function validBookTimerTransition(userId, bookId) {
+      let before = resource.data.get('activeTimer', null);
+      let after = request.resource.data.get('activeTimer', null);
+      return before == after
+             || validChangedBookTimerTransition(userId, bookId, before, after);
+    }
+
+    function validChangedBookTimerTransition(userId, bookId, before, after) {
+      let claimPath = /databases/$(database)/documents/users/$(userId)/timerLifecycle/current;
+      let beforeClaim = get(claimPath).data;
+      let afterClaim = getAfter(claimPath).data;
+      return afterClaim.get("version", 1) == 2 ? v2BookTransition(userId, bookId, afterClaim) : (before == null
+                 && validLocalTimer(after)
+                 && validIdleTimerClaim(beforeClaim)
+                 && localClaimMatchesTimer(afterClaim, bookId, after))
+             || (after == null
+                 && (localClaimMatchesTimer(beforeClaim, bookId, before)
+                     || unknownClaimMatchesTimer(beforeClaim, bookId, before))
+                 && validClearedTimerClaim(afterClaim, beforeClaim))
+             || (validRemoteTimer(before)
+                 && validStoppingTimer(after)
+                 && remoteClaimMatchesTimer(beforeClaim, bookId, before)
+                 && validStoppingTimerClaim(afterClaim)
+                 && afterClaim.bookId == bookId
+                 && afterClaim.entryId == after.entryId
+                 && afterClaim.start == after.start
+                 && afterClaim.queueId == after.queueId);
+    }
+
+    function validLocalTimer(timer) {
+      return timer is map
+             && timer.keys().hasAll(['start', 'operationId'])
+             && timer.keys().hasOnly(['start', 'operationId'])
+             && validTimerStart(timer.start)
+             && timer.operationId is string
+             && timer.operationId.size() > 0
+             && timer.operationId.size() <= 100;
+    }
+
+    function validRemoteTimer(timer) {
+      return timer is map
+             && timer.keys().hasAll(['entryId', 'start'])
+             && timer.keys().hasOnly(['entryId', 'start'])
+             && timer.entryId is int
+             && timer.entryId > 0
+             && validTimerStart(timer.start);
+    }
+
+    function validUnknownTimer(timer) {
+      return timer is map
+             && timer.keys().hasAll([
+                  'state', 'operationId', 'start', 'claimedAt', 'error'
+                ])
+             && timer.keys().hasOnly([
+                  'state', 'operationId', 'start', 'claimedAt', 'error'
+                ])
+             && timer.state == 'outcome-unknown'
+             && timer.operationId is string
+             && timer.operationId.size() > 0
+             && timer.operationId.size() <= 100
+             && validTimerStart(timer.start)
+             && timer.claimedAt is timestamp
+             && timer.error is string
+             && timer.error.size() > 0
+             && timer.error.size() <= 1000;
+    }
+
+    function validStoppingTimer(timer) {
+      return timer is map
+             && timer.keys().hasAll(['state', 'entryId', 'start', 'queueId'])
+             && timer.keys().hasOnly(['state', 'entryId', 'start', 'queueId'])
+             && timer.state == 'stopping'
+             && timer.entryId is int
+             && timer.entryId > 0
+             && validTimerStart(timer.start)
+             && timer.queueId is string
+             // One document id: no slash, the server interpolates it into a
+             // path (SEC-040).
+             && timer.queueId.matches('[^/]{1,600}');
+    }
+
+    function validIdleTimerClaim(claim) {
+      return claim is map
+             && claim.keys().hasAll(['version', 'state', 'cleared'])
+             && claim.keys().hasOnly(['version', 'state', 'cleared'])
+             && claim.version == 1
+             && claim.state == 'idle'
+             && (claim.cleared == null || validActiveTimerClaim(claim.cleared));
+    }
+
+    function validClearedTimerClaim(after, before) {
+      return validIdleTimerClaim(after) && after.cleared == before;
+    }
+
+    function validActiveTimerClaim(claim) {
+      return validLocalTimerClaim(claim)
+             || validRemoteTimerClaim(claim)
+             || validStartingTimerClaim(claim)
+             || validUnknownTimerClaim(claim)
+             || validStoppingTimerClaim(claim);
+    }
+
+    function validClaimBookId(claim) {
+      return claim.version == 1
+             && claim.bookId is string
+             && claim.bookId.size() > 0
+             && claim.bookId.size() <= 500
+             && !claim.bookId.matches('.*[/].*')
+             && claim.bookId != '.'
+             && claim.bookId != '..';
+    }
+
+    function validLocalTimerClaim(claim) {
+      return claim is map
+             && claim.keys().hasAll(['version', 'state', 'bookId', 'operationId', 'start'])
+             && claim.keys().hasOnly(['version', 'state', 'bookId', 'operationId', 'start'])
+             && validClaimBookId(claim)
+             && claim.state == 'local'
+             && claim.operationId is string
+             && claim.operationId.size() > 0
+             && claim.operationId.size() <= 100
+             && validTimerStart(claim.start);
+    }
+
+    function validRemoteTimerClaim(claim) {
+      return claim is map
+             && claim.keys().hasAll(['version', 'state', 'bookId', 'entryId', 'start'])
+             && claim.keys().hasOnly(['version', 'state', 'bookId', 'entryId', 'start'])
+             && validClaimBookId(claim)
+             && claim.state == 'remote'
+             && claim.entryId is int
+             && claim.entryId > 0
+             && validTimerStart(claim.start);
+    }
+
+    function validStartingTimerClaim(claim) {
+      return claim is map
+             && claim.keys().hasAll(['version', 'state', 'bookId', 'operationId', 'start', 'claimedAt'])
+             && claim.keys().hasOnly(['version', 'state', 'bookId', 'operationId', 'start', 'claimedAt'])
+             && validClaimBookId(claim)
+             && claim.state == 'starting'
+             && claim.operationId is string
+             && claim.operationId.size() > 0
+             && claim.operationId.size() <= 100
+             && validTimerStart(claim.start)
+             && claim.claimedAt is timestamp;
+    }
+
+    function validUnknownTimerClaim(claim) {
+      return claim is map
+             && claim.keys().hasAll(['version', 'state', 'bookId', 'operationId', 'start', 'claimedAt', 'error'])
+             && claim.keys().hasOnly(['version', 'state', 'bookId', 'operationId', 'start', 'claimedAt', 'error'])
+             && validClaimBookId(claim)
+             && claim.state == 'outcome-unknown'
+             && claim.operationId is string
+             && claim.operationId.size() > 0
+             && claim.operationId.size() <= 100
+             && validTimerStart(claim.start)
+             && claim.claimedAt is timestamp
+             && claim.error is string
+             && claim.error.size() > 0
+             && claim.error.size() <= 1000;
+    }
+
+    function validStoppingTimerClaim(claim) {
+      return claim is map
+             && claim.keys().hasAll(['version', 'state', 'bookId', 'entryId', 'start', 'queueId'])
+             && claim.keys().hasOnly(['version', 'state', 'bookId', 'entryId', 'start', 'queueId'])
+             && validClaimBookId(claim)
+             && claim.state == 'stopping'
+             && claim.entryId is int
+             && claim.entryId > 0
+             && validTimerStart(claim.start)
+             && claim.queueId is string
+             // One document id: no slash, the server interpolates it into a
+             // path (SEC-040).
+             && claim.queueId.matches('[^/]{1,600}');
+    }
+
+    function validTimerStart(start) {
+      return start is string
+             && start.size() > 0
+             && start.size() <= 64
+             && start.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})');
+    }
+
+    function localClaimMatchesTimer(claim, bookId, timer) {
+      return validLocalTimerClaim(claim)
+             && validLocalTimer(timer)
+             && claim.bookId == bookId
+             && claim.operationId == timer.operationId
+             && claim.start == timer.start;
+    }
+
+    function remoteClaimMatchesTimer(claim, bookId, timer) {
+      return validRemoteTimerClaim(claim)
+             && validRemoteTimer(timer)
+             && claim.bookId == bookId
+             && claim.entryId == timer.entryId
+             && claim.start == timer.start;
+    }
+
+    function unknownClaimMatchesTimer(claim, bookId, timer) {
+      return validUnknownTimerClaim(claim)
+             && validUnknownTimer(timer)
+             && claim.bookId == bookId
+             && claim.operationId == timer.operationId
+             && claim.start == timer.start
+             && claim.claimedAt == timer.claimedAt
+             && claim.error == timer.error;
+    }
+
+    function validClientTimerClaimTransition(userId) {
+      let before = resource.data;
+      let after = request.resource.data;
+      return (validIdleTimerClaim(before)
+              && legacyStartAllowed(userId)
+              && validLocalTimerClaim(after)
+              && validLocalBookStart(userId, after))
+             || (validLocalTimerClaim(before)
+                 && validClearedTimerClaim(after, before)
+                 && validLocalBookClear(userId, before))
+             || (validUnknownTimerClaim(before)
+                 && validClearedTimerClaim(after, before)
+                 && validUnknownBookClear(userId, before))
+             || (validRemoteTimerClaim(before)
+                 && validStoppingTimerClaim(after)
+                 && validRemoteBookStopQueue(userId, before, after));
+    }
+
+    function validLocalBookStart(userId, claim) {
+      let path = /databases/$(database)/documents/users/$(userId)/books/$(claim.bookId);
+      return exists(path)
+             && get(path).data.get('activeTimer', null) == null
+             && localClaimMatchesTimer(
+                  claim, claim.bookId, getAfter(path).data.activeTimer
+                );
+    }
+
+    function validLocalBookClear(userId, claim) {
+      let path = /databases/$(database)/documents/users/$(userId)/books/$(claim.bookId);
+      return exists(path)
+             && localClaimMatchesTimer(claim, claim.bookId, get(path).data.activeTimer)
+             && (!existsAfter(path)
+                 || getAfter(path).data.get('activeTimer', null) == null);
+    }
+
+    function validUnknownBookClear(userId, claim) {
+      let path = /databases/$(database)/documents/users/$(userId)/books/$(claim.bookId);
+      return exists(path)
+             && existsAfter(path)
+             && unknownClaimMatchesTimer(claim, claim.bookId, get(path).data.activeTimer)
+             && getAfter(path).data.get('activeTimer', null) == null;
+    }
+
+    function validRemoteBookStopQueue(userId, before, after) {
+      let path = /databases/$(database)/documents/users/$(userId)/books/$(before.bookId);
+      let queuePath = /databases/$(database)/documents/users/$(userId)/togglQueue/$(after.queueId);
+      let item = getAfter(queuePath).data;
+      return before.bookId == after.bookId
+             && before.entryId == after.entryId
+             && before.start == after.start
+             && after.queueId == before.bookId + '_' + before.start
+             && exists(path)
+             && existsAfter(path)
+             && validRemoteTimer(get(path).data.activeTimer)
+             && get(path).data.activeTimer.entryId == before.entryId
+             && get(path).data.activeTimer.start == before.start
+             && validStoppingTimer(getAfter(path).data.activeTimer)
+             && getAfter(path).data.activeTimer.entryId == after.entryId
+             && getAfter(path).data.activeTimer.start == after.start
+             && getAfter(path).data.activeTimer.queueId == after.queueId
+             && existsAfter(queuePath)
+             && item.type == 'stop'
+             && item.timerClaimVersion == 1
+             && item.bookId == before.bookId
+             && item.entryId == before.entryId
+             && item.start == before.start;
+    }
+
+    function validDeletedLocalTimerClaim(userId, bookId) {
+      let path = /databases/$(database)/documents/users/$(userId)/timerLifecycle/current;
+      let before = get(path).data;
+      let after = getAfter(path).data;
+      return localClaimMatchesTimer(before, bookId, resource.data.activeTimer)
+             && validClearedTimerClaim(after, before);
+    }
+    // Offline Toggl sync queue: the only row a client can create is the
+    // atomic offline-stop row — the deterministic `bookId_start` row written
+    // in the same batch that clears that exact timer (SEC-002: ordinary
+    // creates, which the client stopped writing on 2026-08-24, are gone, so
+    // no client can mint a queue row that is not coupled to a real timer
+    // clear). An owner can read its lifecycle; the Admin SDK alone writes
+    // processing, error and synced states. A client retry can only set
+    // pending plus a new server timestamp, only after the same stale
+    // windows the client sweep uses, never before a server-pinned deferral
+    // has ended, and never after the fifth claim. The timestamp makes a
+    // retry of an unchanged pending status emit a production Firestore
+    // event.
+    //
+    // Two server-owned counters bound the queue. functionQuotas/togglQueue
+    // meters remote Toggl calls (ten per hour); an over-quota row is
+    // deferred, not refused, so an offline stop never rolls its timer back
+    // and its interval is never lost. functionQuotas/togglQueueRows counts
+    // rows themselves (sixty per hour, moved by the trigger the first time
+    // it touches a row) and closes this create rule once full: a client can
+    // start and stop timers as fast as it likes, so without it one account
+    // yields unlimited rows and Eventarc deliveries. The count lags the
+    // writes by one delivery, so a burst overshoots but cannot sustain; a
+    // refused stop leaves the timer running. Retry writes bypass both: the
+    // server claim transaction remains the authoritative gate, and the
+    // marker plus the deferral limit a stuck row to one delivery request
+    // per ten-minute window and one per quota window respectively.
+    match /users/{userId}/togglQueue/{queueId} {
+      allow read: if request.auth != null && userId == request.auth.uid;
+      allow create: if request.auth != null && userId == request.auth.uid
+                    && togglConfigured(userId)
+                    && validInitialTogglQueueItem()
+                    && request.resource.data.get('timerClaimVersion', 0) == 1
+                    && validAtomicTimerStop(userId, queueId)
+                    && togglQueueRowsAvailable(userId);
+      allow update: if request.auth != null && userId == request.auth.uid
+                    && togglConfigured(userId)
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(['status', 'retryRequestedAt'])
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasAll(['retryRequestedAt'])
+                    && !resource.data.keys().hasAny(["legacyResolution"])
+                    && togglRetryMarkerOpen()
+                    && request.resource.data.status == 'pending'
+                    && validRetryTogglQueueItem()
+                    && resource.data.get('attempts', 0) < 5
+                    && togglRetryWindowOpen();
+    }
+
+    // createdAt stays client-chosen (an offline stop is recorded with the
+    // device clock) but may not run ahead of the server by more than the
+    // skew allowance: the retry window and the deferred row's expiry are
+    // both measured from it, and a forward-dated row was re-armable at
+    // once and, once deferred, TTL-immortal.
+    function validInitialTogglQueueItem() {
+      let item = request.resource.data;
+      return validTogglQueuePayload(item)
+             && item.status == 'pending'
+             && item.createdAt is timestamp
+             && item.createdAt <= request.time + duration.value(300, 's')
+             && item.keys().hasOnly([
+                  'type', 'bookId', 'bookTitle', 'start', 'stop', 'entryId',
+                  'timerClaimVersion', 'status', 'createdAt'
+                ]);
+    }
+
+    function validRetryTogglQueueItem() {
+      let item = request.resource.data;
+      return validTogglQueuePayload(item)
+             && item.status == 'pending'
+             && item.createdAt is timestamp
+             && item.retryRequestedAt is timestamp
+             && item.retryRequestedAt == request.time
+             && item.keys().hasOnly([
+                  'type', 'bookId', 'bookTitle', 'start', 'stop', 'entryId',
+                  'timerClaimVersion', 'status', 'createdAt', 'attempts', 'claimedAt', 'error',
+                  'expiresAt', 'retryRequestedAt', 'deferredUntil', 'deferrals'
+                ])
+             && ((!item.keys().hasAny(['attempts', 'claimedAt', 'error']))
+                  || (item.attempts is int
+                      && item.attempts > 0
+                      && item.attempts < 5
+                      && item.claimedAt is timestamp
+                      // The update rule pins affectedKeys to status and
+                      // retryRequestedAt, so error can never change here;
+                      // only its type is worth asserting.
+                      && (!item.keys().hasAny(['error']) || item.error is string)));
+    }
+
+    function validTogglQueuePayload(item) {
+      return item.keys().hasAll([
+               'type', 'bookTitle', 'start', 'stop', 'status', 'createdAt'
+             ])
+             && item.type in ['create', 'stop']
+             && (!item.keys().hasAny(['timerClaimVersion'])
+                 || item.timerClaimVersion == 1)
+             && (!item.keys().hasAny(['bookId'])
+                  || (item.bookId is string
+                      && item.bookId.matches('[^/]{1,500}')
+                      && item.bookId != '.'
+                      && item.bookId != '..'))
+             && item.bookTitle is string
+             && item.bookTitle.size() > 0
+             && item.bookTitle.size() <= 500
+             && item.start is string
+             && item.start.size() > 0
+             && item.start.size() <= 64
+             && item.start.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})')
+             && item.stop is string
+             && item.stop.size() > 0
+             && item.stop.size() <= 64
+             && item.stop.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})')
+             && (item.type == 'create'
+                  ? !item.keys().hasAny(['entryId'])
+                  : (item.keys().hasAll(['entryId'])
+                     && item.entryId is int
+                     && item.entryId > 0));
+    }
+
+    // The one client-creatable queue row: the deterministic row written in
+    // the same batch that clears that exact timer. A full claim quota must
+    // not make an offline stop roll its book timer back, so the remote-call
+    // quota is not consulted here; the row counter is (see the match).
+    function validAtomicTimerStop(userId, queueId) {
+      let item = request.resource.data;
+      let bookId = item.get('bookId', '');
+      let path = /databases/$(database)/documents/users/$(userId)/books/$(bookId);
+      let claimPath = /databases/$(database)/documents/users/$(userId)/timerLifecycle/current;
+      let before = get(path).data;
+      let after = getAfter(path).data;
+      let timer = before.get('activeTimer', null);
+      let beforeClaim = get(claimPath).data;
+      let afterClaim = getAfter(claimPath).data;
+      return item.keys().hasAll(['bookId'])
+             && item.timerClaimVersion == 1
+             && queueId == bookId + '_' + item.start
+             && exists(path)
+             && ((item.type == 'create'
+                  && validLocalTimer(timer)
+                  && timer.start == item.start
+                  && localClaimMatchesTimer(beforeClaim, bookId, timer)
+                  && after.get('activeTimer', null) == null
+                  && validClearedTimerClaim(afterClaim, beforeClaim))
+                 || (item.type == 'stop'
+                     && validRemoteTimer(timer)
+                     && timer.entryId == item.entryId
+                     && timer.start == item.start
+                     && validRemoteTimerClaim(beforeClaim)
+                     && beforeClaim.bookId == bookId
+                     && beforeClaim.entryId == timer.entryId
+                     && beforeClaim.start == timer.start
+                     && validStoppingTimer(after.activeTimer)
+                     && after.activeTimer.queueId == queueId
+                     && validStoppingTimerClaim(afterClaim)
+                     && afterClaim.bookId == bookId
+                     && afterClaim.entryId == after.activeTimer.entryId
+                     && afterClaim.start == after.activeTimer.start
+                     && afterClaim.queueId == after.activeTimer.queueId));
+    }
+
+    // A row the server deferred (quota window full) carries the
+    // server-pinned end of that window; no retry marker before it, so a
+    // deferred row costs one delivery per window instead of six. The
+    // trigger only stamps pending rows and clears the stamp on every
+    // transition, but the gate covers every branch rather than trust that.
+    function togglRetryWindowOpen() {
+      return togglDeferralEnded()
+             && (resource.data.status == 'error'
+             || (resource.data.status == 'pending'
+                 && resource.data.createdAt is timestamp
+                 && resource.data.createdAt
+                    < request.time - duration.value(600, 's'))
+             || (resource.data.status == 'processing'
+                 && resource.data.claimedAt is timestamp
+                 && resource.data.claimedAt
+                    < request.time - duration.value(21600, 's')));
+    }
+
+    function togglDeferralEnded() {
+      return !resource.data.keys().hasAny(['deferredUntil'])
+             || (resource.data.deferredUntil is timestamp
+                 && resource.data.deferredUntil <= request.time);
+    }
+
+    // A pending retry marker suppresses duplicate Eventarc deliveries during
+    // the normal lost-event recovery window. If no function claims it, let a
+    // later sweep refresh the timestamp so the unchanged pending row emits a
+    // new write event. The strict boundary matches the client sweep.
+    function togglRetryMarkerOpen() {
+      return !resource.data.keys().hasAny(['retryRequestedAt'])
+             || (resource.data.retryRequestedAt is timestamp
+                 && resource.data.retryRequestedAt
+                    < request.time - duration.value(600, 's'));
+    }
+
+    // Status-only mirror written by toggl-savetoken (SEC-004): the
+    // credential itself lives in the `secrets` database, which client
+    // rules deny outright and this engine cannot reach either (get()
+    // reads the database it runs in). The gate checks that the server
+    // recorded a connection, not the credential; the pre-SEC-004 shape
+    // (with apiToken) fails hasOnly, so a queue create against an
+    // unmigrated account refuses rather than trusting a stale token.
+    function togglConfigured(userId) {
+      let path = /databases/$(database)/documents/users/$(userId);
+      let toggl = get(path).data.get('toggl', null);
+      return exists(path)
+             && get(path).data.get("timeTracking", {"provider":"toggl"}).provider == "toggl"
+             && toggl is map
+             && toggl.keys().hasAll(['workspaceId', 'projectId', 'connectedAt'])
+             && toggl.keys().hasOnly(['workspaceId', 'projectId', 'connectedAt'])
+             && toggl.workspaceId is int
+             && toggl.workspaceId > 0
+             && toggl.projectId is int
+             && toggl.projectId > 0
+             && toggl.connectedAt is timestamp;
+    }
+
+    // Mirrors functions/src/togglQueueLimits.ts (TOGGL_QUEUE_ROW_LIMIT,
+    // TOGGL_QUEUE_WINDOW_MS) and the shape applyQuota writes. Only the Admin
+    // SDK can write the counter, so a malformed document is a server bug and
+    // fails closed here; a missing or expired one is an open window.
+    function togglQueueRowsAvailable(userId) {
+      let path = /databases/$(database)/documents/users/$(userId)/functionQuotas/togglQueueRows;
+      return !exists(path)
+             || (get(path).data.keys().hasAll(['windowStartedAt', 'count'])
+                 && get(path).data.keys().hasOnly(['windowStartedAt', 'count'])
+                 && get(path).data.windowStartedAt is timestamp
+                 && get(path).data.count is int
+                 && get(path).data.count >= 0
+                 && (get(path).data.windowStartedAt
+                       <= request.time - duration.value(3600, 's')
+                     || get(path).data.count < 60));
+    }
+
+    // A separate marker opts an already-public profile into search. Keeping
+    // this outside the profile doc matters for cached clients: they replace
+    // profile docs wholesale, but know nothing about this collection and
+    // therefore cannot erase a newer search choice. Client list is forbidden;
+    // the server-side sitemap enumerates markers with the Admin SDK.
+    // Publishing to the public web — a profile page, and its discovery
+    // marker that puts it in the shared sitemap — is for verified accounts
+    // whose users document still exists (SEC-033, SEC-062): sign-up is open
+    // and unverified, and an account deleted in Auth keeps a valid ID token
+    // for up to an hour, so without both checks anyone could plant an
+    // indexable page under a name nobody could later delete.
+    // A deleted account is tombstoned, not removed (SEC-006): its users
+    // document stays with deletedAt set, and for the hour its ID token
+    // outlives it the identity must not publish. A missing document is a
+    // null-value error here, which denies — the same outcome exists() gave.
+    // The account is not tombstoned (SEC-006). A missing users document is
+    // a null-value error here, which denies — a live account always has
+    // one (the sign-up trigger creates it and soft-delete keeps it).
+    function accountLive() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('deletedAt', null) == null;
+    }
+    function verifiedAccount() {
+      return request.auth.token.get('email_verified', false) == true
+             && accountLive();
+    }
+    // The operator: the same pair of checks functions/src/admin.ts applies
+    // before an admin callable reads, on the immutable UID rather than an
+    // email (a claimable string while sign-up is open).
+    function isOperator() {
+      return request.auth != null
+             && request.auth.uid == '1Cf0CaNfgnVSvTrF5dYjzRd9Xri2'
+             && verifiedAccount();
+    }
+
+    match /profileDiscovery/{username} {
+      allow get: if request.auth != null
+                 && get(/databases/$(database)/documents/profiles/$(username)).data.uid
+                    == request.auth.uid;
+      allow list: if false;
+      allow create: if request.auth != null
+                    && verifiedAccount()
+                    && username.matches('[a-z0-9-]{3,30}')
+                    && request.resource.data.keys().hasAll(['uid', 'createdAt'])
+                    && request.resource.data.keys().hasOnly(['uid', 'createdAt'])
+                    && request.resource.data.uid == request.auth.uid
+                    // Server-pinned: the public sitemap scan orders markers by
+                    // createdAt, oldest first, so a client-chosen (backdated)
+                    // value could sort a seeded marker ahead of real profiles.
+                    && request.resource.data.createdAt == request.time
+                    && ownsPublicProfileAfter(username);
+      allow update: if false;
+      // Own marker first: a batched write may make at most 20 document
+      // accesses, and the discoverable rename batch touches six documents
+      // through these rules, so the honest path must stay cheap.
+      allow delete: if request.auth != null
+                    && (resource.data.uid == request.auth.uid
+                        || (exists(/databases/$(database)/documents/profiles/$(username))
+                            && get(/databases/$(database)/documents/profiles/$(username)).data.uid
+                               == request.auth.uid));
+    }
+
+    function ownsPublicProfileAfter(username) {
+      let profile = getAfter(/databases/$(database)/documents/profiles/$(username)).data;
+      return profile.uid == request.auth.uid && profile.public == true;
+    }
+
+    // Opt-in public profile pages: /profiles/<username> renders this doc.
+    // The `public` flag decides whether the publicweb function will serve
+    // it; the document itself is readable only by its owner. Public profiles
+    // reach everyone through that function (Admin SDK, CDN- and
+    // instance-cached HTML plus /profiles/<username>.json without the
+    // uid). Letting anonymous clients get the raw doc handed any requester
+    // an uncached, uncapped ~700 KB read with no credential and exposed the
+    // owner's Firebase uid (SEC-019). Any profile that is not the caller's
+    // own — public, private, or missing — reads as permission-denied, which
+    // the client renders as not-found so no read path leaks username
+    // existence. (A get on a missing doc also lands here as an evaluation
+    // error → denied, deliberately the same signal.) The write path
+    // necessarily does leak it: a create on a taken name fails and on a
+    // free name succeeds — inherent to a first-writer-wins namespace; the
+    // per-uid cap that bounds squatting is SEC-032. `list` is
+    // owner-only — the Me page finds its own doc by querying on uid, and
+    // strangers must not be able to enumerate usernames. The username is
+    // the doc id, so uniqueness is first-writer-wins: a create against an
+    // existing doc evaluates as an update and fails the uid pin. Publicly
+    // rendered surface, so the validation-heavy style applies: the shape
+    // is pinned so the doc can only ever hold aggregate reading numbers
+    // plus two deliberately short name parts (givenName/familyName, the
+    // app-wide person-name convention) — nothing a profile link could be
+    // used to host arbitrary content on.
+    //
+    // One profile per account (SEC-032): profileOwners/{uid} names the one
+    // username an account holds, and every profile create, rename and
+    // delete must move it in the same batch — a second profile would need
+    // the first one gone. That is also what makes a freed username's
+    // marker inert (SEC-036): a profile delete takes its own marker with
+    // it. Names the site uses for itself are reserved. updatedAt is
+    // server-pinned because the shared sitemap publishes it as <lastmod>
+    // (SEC-035).
+    match /profiles/{username} {
+      allow get: if request.auth != null && resource.data.uid == request.auth.uid;
+      allow list: if request.auth != null && resource.data.uid == request.auth.uid;
+      allow create: if request.auth != null
+                    && verifiedAccount()
+                    && username.matches('[a-z0-9-]{3,30}')
+                    && !(username in [
+                         'admin', 'administrator', 'api', 'app', 'assets', 'auth', 'book',
+                         'books', 'help', 'isbns', 'login', 'logout', 'null', 'owner',
+                         'profile', 'profiles', 'register', 'root', 'sitemap', 'static',
+                         'support', 'system', 'undefined', 'www'
+                       ])
+                    && validProfile()
+                    && validProfileClaim(username);
+      allow update: if request.auth != null
+                    && verifiedAccount()
+                    && resource.data.uid == request.auth.uid
+                    && validProfile();
+      // A tombstoned profile is the record of a deleted account; only an
+      // operator purge removes it. accountLive() closes the window in
+      // which deleteUserDocument has tombstoned users/{uid} but not yet
+      // reached this profile: the residual identity (its ID token lives an
+      // hour past deletion) must not delete its own not-yet-tombstoned
+      // profile and free the reserved name. Not verifiedAccount(): an
+      // unverified live owner may still delete what it has.
+      allow delete: if request.auth != null
+                    && resource.data.uid == request.auth.uid
+                    && resource.data.get('deletedAt', null) == null
+                    && accountLive()
+                    && validProfileRelease(username);
+    }
+
+    // The batch that creates profiles/{username} must leave
+    // profileOwners/{uid} naming it, and if the account already held a
+    // username that profile must be gone in the same batch (rename).
+    // Ternaries, not ||: a get() inside a path is evaluated eagerly, and
+    // a missing record must not be a null-value error.
+    function validProfileClaim(username) {
+      let owner = /databases/$(database)/documents/profileOwners/$(request.auth.uid);
+      return existsAfter(owner)
+             && getAfter(owner).data.username == username
+             && (exists(owner)
+                 ? !existsAfter(/databases/$(database)/documents/profiles/$(get(owner).data.username))
+                 : true);
+    }
+
+    // Deleting a profile must release the ownership record (or move it to
+    // the renamed profile) and take the profile's own discovery marker
+    // with it; a marker left behind by another account is not ours to
+    // touch and is inert without a uid-matching profile.
+    function validProfileRelease(username) {
+      let owner = /databases/$(database)/documents/profileOwners/$(request.auth.uid);
+      let marker = /databases/$(database)/documents/profileDiscovery/$(username);
+      return (existsAfter(owner) ? getAfter(owner).data.username != username : true)
+             && (exists(marker)
+                 ? (!existsAfter(marker) || get(marker).data.uid != request.auth.uid)
+                 : true);
+    }
+
+    // Owner-only, and only ever moved inside a profile batch: it may name
+    // a username only while that profile exists after the batch and is
+    // ours, and it may stop naming one only once that profile is gone.
+    match /profileOwners/{ownerUid} {
+      allow read: if request.auth != null && ownerUid == request.auth.uid;
+      allow create: if request.auth != null && ownerUid == request.auth.uid
+                    && validProfileOwnerRecord()
+                    && ownsProfileAfter(request.resource.data.username);
+      allow update: if request.auth != null && ownerUid == request.auth.uid
+                    && validProfileOwnerRecord()
+                    && ownsProfileAfter(request.resource.data.username)
+                    && (resource.data.username == request.resource.data.username
+                        || !existsAfter(/databases/$(database)/documents/profiles/$(resource.data.username)));
+      // A profile from before this record existed has none; the client's
+      // delete batch removes the record unconditionally, and a delete of a
+      // missing document must not be a null-value error (resource is null).
+      allow delete: if request.auth != null && ownerUid == request.auth.uid
+                    && (resource == null
+                        ? true
+                        : !existsAfter(/databases/$(database)/documents/profiles/$(resource.data.username)));
+    }
+
+    function validProfileOwnerRecord() {
+      let record = request.resource.data;
+      return record.keys().hasAll(['username'])
+             && record.keys().hasOnly(['username'])
+             && record.username is string
+             && record.username.matches('[a-z0-9-]{3,30}');
+    }
+
+    function ownsProfileAfter(username) {
+      let path = /databases/$(database)/documents/profiles/$(username);
+      return existsAfter(path) && getAfter(path).data.uid == request.auth.uid;
+    }
+
+    function validProfile() {
+      let profile = request.resource.data;
+      let statKeys = ['totalBooks', 'finishedBooks', 'readingBooks', 'totalTimeReadHours',
+                      'totalPagesRead', 'booksPerYear', 'avgTimePerBook', 'authors'];
+      return profile.keys().hasAll(['uid', 'public', 'givenName', 'familyName', 'links', 'stats', 'records', 'years', 'days', 'updatedAt'])
+             && profile.keys().hasOnly(['uid', 'public', 'givenName', 'familyName', 'links', 'stats', 'records', 'years', 'days', 'updatedAt'])
+             && profile.uid == request.auth.uid
+             && profile.public is bool
+             && profile.givenName is string
+             && profile.givenName.size() <= 50
+             && profile.familyName is string
+             && profile.familyName.size() <= 50
+             // Public handles ({type, value, label?}); rules can't iterate
+             // list elements, so the per-entry shape and string caps are
+             // client-enforced (utils/links.ts). Owner-authenticated
+             // writes only, and the client renders values as text and
+             // scheme-guarded hrefs, so the count cap bounds the surface.
+             && profile.links is list
+             && profile.links.size() <= 10
+             && profile.stats is map
+             && profile.stats.keys().hasAll(statKeys)
+             && profile.stats.keys().hasOnly(statKeys)
+             && profile.stats.totalBooks is number
+             && profile.stats.finishedBooks is number
+             && profile.stats.readingBooks is number
+             && profile.stats.totalTimeReadHours is number
+             && profile.stats.totalPagesRead is number
+             && profile.stats.booksPerYear is number
+             && profile.stats.avgTimePerBook is number
+             && profile.stats.authors is number
+             && validProfileRecords(profile.records)
+             // One row per year with finished books; 200 outlives everyone.
+             && profile.years is list
+             && profile.years.size() <= 200
+             // Per-day heatmap aggregates: one entry per active reading
+             // day, so 4000 is over a decade of daily reading. The client
+             // clamps to the newest 4000 (PROFILE_MAX_DAYS) to match.
+             && profile.days is list
+             && profile.days.size() <= 4000
+             && profile.updatedAt == request.time;
+    }
+
+    function validProfileRecords(records) {
+      return records == null
+             || (records is map
+                 && records.keys().hasAll(['momentum', 'superlatives'])
+                 && records.keys().hasOnly(['momentum', 'superlatives'])
+                 && validProfileMomentum(records.momentum)
+                 && validProfileSuperlatives(records.superlatives));
+    }
+
+    function validProfileMomentum(momentum) {
+      return momentum == null
+             || (momentum is map
+                 && momentum.keys().hasAll(['recentPagesPerDay', 'lifetimePagesPerDay', 'ratio'])
+                 && momentum.keys().hasOnly(['recentPagesPerDay', 'lifetimePagesPerDay', 'ratio'])
+                 && momentum.recentPagesPerDay is number
+                 && momentum.lifetimePagesPerDay is number
+                 && (momentum.ratio == null || momentum.ratio is number));
+    }
+
+    function validProfileSuperlatives(records) {
+      return records is map
+             && records.keys().hasAll(['biggestDay', 'longestSession', 'medianSessionMinutes', 'fastestFinish'])
+             && records.keys().hasOnly(['biggestDay', 'longestSession', 'medianSessionMinutes', 'fastestFinish'])
+             && (records.biggestDay == null
+                 || (records.biggestDay is map
+                     && records.biggestDay.keys().hasAll(['day', 'pages'])
+                     && records.biggestDay.keys().hasOnly(['day', 'pages'])
+                     && records.biggestDay.day is string
+                     && records.biggestDay.pages is number))
+             && (records.longestSession == null
+                 || (records.longestSession is map
+                     && records.longestSession.keys().hasAll(['minutes'])
+                     && records.longestSession.keys().hasOnly(['minutes'])
+                     && records.longestSession.minutes is number))
+             && records.medianSessionMinutes is number
+             && (records.fastestFinish == null
+                 || (records.fastestFinish is map
+                     && records.fastestFinish.keys().hasAll(['days', 'pageCount'])
+                     && records.fastestFinish.keys().hasOnly(['days', 'pageCount'])
+                     && records.fastestFinish.days is number
+                     && records.fastestFinish.pageCount is number));
+    }
+
+    // logEvents (the durable issue log the admin overview reads) and
+    // adminAudit intentionally have no match blocks: both are written and
+    // read exclusively by the Admin SDK. Clients used to create logEvents
+    // rows directly — anonymously for failed sign-ins, and under their own
+    // uid once signed in. The anonymous branch was an unauthenticated write
+    // endpoint anyone could flood (billed writes, billed storage mirrored by
+    // PITR and every backup, billed TTL deletes), and the authenticated one
+    // had no rate limit, so one account could bury the operator's feed
+    // (SEC-001, SEC-038). Signed-in clients now report through the
+    // telemetry-reportissue callable, which allowlists the event, bounds
+    // every field, pins the uid, refuses any free-form detail (SEC-029) and
+    // counts reports per user in users/{uid}/functionQuotas/issueReports —
+    // a document no client rule reaches. Anonymous sign-in failures are no
+    // longer recorded at all: the only thing a signed-out client could
+    // truthfully report was that its own attempt failed, and that signal
+    // was not worth an open write path.
+
+    match /{path=**}/updates/{updateId} {
+      allow read: if request.auth != null &&
+                     resource.data.owner == /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    // Every personal book at once, for the operator's live catalog scan.
+    // Books live only under users/{uid}/books, whose rule covers a single
+    // get; a collection-group query needs this wildcard match.
+    match /{path=**}/books/{bookId} {
+      allow list: if isOperator();
+    }
+  }
+}
