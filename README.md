@@ -1,393 +1,260 @@
-# The Stupid-Simple Book Tracker
+# MARGIN — A personal reading journal
 
-[Book Tracker](https://book.ankile.com) is a responsive web app for tracking
-books, reading progress, reading sessions, and reading statistics. It supports
-offline work and optional public profiles.
+[![Visit MARGIN](https://img.shields.io/badge/Visit-MARGIN-cda93e?style=for-the-badge)](https://aromalsp123.github.io/Book-tracker/)
 
-New to the codebase? Start with the [architecture and site map](docs/architecture/README.md).
+MARGIN is a calm, personal reading journal built for readers who want to track
+what they read, how long they spend reading, and what passages matter enough to
+keep. It is designed to feel like a quiet reading ritual rather than another
+productivity dashboard: warm paper tones, bookish visuals, and lightweight,
+low-friction interactions sit at the center of the experience.
 
-Any change to the architecture, routes, access model, data flows, or external
-integrations must update the relevant map source and regenerate its image
-artifacts in the same change. Keep every public map sanitized according to the
-[architecture guide](docs/architecture/README.md#public-sanitization-rules).
+This project is more than a list of books. It is a private reading life: your
+library, your progress, your notes, your reading sessions, and the small moments
+that make a book memorable.
 
-## Architecture maps
+## Why MARGIN exists
 
-These are the sanitized public views. The architecture guide contains the
-editable Mermaid and JavaScript sources, PNG copies, and rendering commands.
+Many reading trackers focus on quantity: pages, streaks, and completion bars. MARGIN
+starts from a different idea.
 
-### System context
+- a book is a personal experience, not just a task
+- reading time should be easy to record without friction
+- quotes and notes should live next to the book they came from
+- a library should help you remember where you are, not just add titles
+- personal data should remain private and under your control
 
-![Book Tracker system context](docs/architecture/system-context.svg)
 
-### Application architecture
+That philosophy is reflected in the app's flow: build a collection, update page
+progress, log sessions, capture passages, and look back at patterns over time.
 
-![Book Tracker application architecture](docs/architecture/app-architecture.svg)
+## At a glance
 
-### Backend responsibilities and data flows
+- Local-first reading journal for personal tracking
+- Book library with read/current/to-read states
+- Page-progress updates and reading-session logging
+- Time tracking support for external services such as Toggl and Threeggle
+- Favorite passages and notes attached to books
+- Reading summaries, stats, and dashboard views
+- Optional signed-in account flows with shared catalog metadata and richer browsing
+- Browser-stored personal data with a public catalog model for shared book metadata
 
-![Book Tracker backend responsibilities and data flows](docs/architecture/backend-runtime.svg)
+## Highlights
 
-### Pages and navigation
+### Personal library management
 
-![Book Tracker pages and navigation](docs/architecture/site-functionality.svg)
+MARGIN keeps a personal library that can grow naturally over time. You can track
+which books are planned, currently being read, or already finished. Each record can
+carry its own status, progress, and context, making the library useful both for an
+active reading life and for looking back over years of books.
 
-### Route access and writes
+### Reading progress and sessions
 
-![Book Tracker route access and write matrix](docs/architecture/site-access.svg)
+The journal is not only about a to-read pile. It supports real reading progress:
 
-## Screenshots
+- page counts and current-page tracking
+- reading session logs
+- active reading timers
+- elapsed time summaries
+- progress estimates and reading pace views
 
-### Currently reading
+This makes it useful for readers who want both a sense of momentum and a record of
+what they actually read.
 
-![Currently Reading page](docs/screenshots/currently_reading.png)
+### Quotes, notes, and memory anchors
 
-### Profile and reading activity
+A good book often leaves a sentence, paragraph, or idea worth keeping. MARGIN lets
+readers save those memorable passages alongside the book they came from, turning a
+reading log into a continuing journal of reflection.
 
-![Profile page with statistics and reading heatmap](docs/screenshots/my_page.png)
+### Dashboard and statistics
 
-## What the app does
+The app is designed to surface patterns quickly. A reader can look at the current
+book, recent sessions, elapsed time, and high-level summaries without needing to dig
+through the whole library. This is especially helpful when a book spans weeks or a
+reading season includes many titles.
 
-- Adds, edits, and removes books from a personal library.
-- Tracks page progress, finished books, and reading sessions.
-- Starts and stops reading timers with one persistent choice: local-only,
-  Toggl Track, or Threeggle. The new integration follows a reader-first rollout.
-- Shows yearly statistics, reading streaks, a daily activity heatmap, and
-  per-book reading speed.
-- Resolves authors through one shared catalog and lets authorized operators
-  curate author identities, aliases, classifications, and merges.
-- Suggests existing shared works and editions while keeping each reader's
-  own title, page count, progress, and reading history independent.
-- Shows opted-in reading summaries for a shared work without exposing raw
-  session records.
-- Finds books whose ISBN data needs repair.
-- Publishes an optional reading profile with a separate search-discovery
-  setting.
-- Provides a restricted, read-only operational overview.
+### Shared metadata without exposing private reading history
 
-The route catalog and access matrix live in the
-[architecture guide](docs/architecture/README.md#route-catalog).
+The project includes a carefully structured shared catalog layer for authors,
+works, and editions. Personal books remain connected to the owner, while shared
+bibliographic metadata is separated from private reading data. This makes it a strong
+example of a product that balances personal records with reusable, public catalog
+information.
 
-## Book metadata
+## Website screenshots
 
-The add and edit dialog can look up an ISBN through three catalog sources. The
-requests are independent, so one unavailable source does not discard useful
-responses from the others.
+### Home page
 
-Metadata precedence is field-specific:
+![MARGIN home page with the reading-journal introduction and book illustration](docs/screenshots/margin-homepage.png)
 
-| Field | Preferred source | Fallbacks |
-|---|---|---|
-| Cover | Metered catalog | Open catalog, then national catalog |
-| Fiction classification | Metered catalog | National catalog, then open catalog |
-| Publisher and publication date | Open catalog | Metered catalog, then national catalog |
-| Subjects | Open catalog | Metered catalog, then national catalog |
+### Reading dashboard
 
-The lookup also fills empty title, author, and page-count inputs. It does not
-silently replace values the user already entered.
+![MARGIN reading dashboard showing the currently-reading book, reading time, and sessions](docs/screenshots/margin-dashboard.png)
 
-Stored metadata is advisory display data. Firestore Rules allowlist the book
-fields, validate their types and sizes, and restrict writes to the owner.
-Application authorization must never depend on catalog metadata being correct.
+### Personal library
 
-Historical enrichment scripts are gap-fill migrations. They use a deliberate
-source order and must follow the review, snapshot, rehearsal, and audit process
-in [MIGRATIONS.md](MIGRATIONS.md). The Goodreads script is a manual historical
-fallback only. It is not part of the live app or a scheduled workflow.
+![MARGIN personal library with book cards and reading-status filters](docs/screenshots/margin-library.png)
 
-Books without a valid ISBN appear on `/isbns` and can be repaired through the
-normal edit dialog.
+## How the app works
 
-## Shared catalog
+MARGIN is built as a modern frontend application with a lightweight backend and
+supporting services.
 
-The shared catalog connects personal books without replacing them. A Work is
-the common intellectual work and references shared author entities. An Edition
-is a publication of that Work and can carry its own identifier, title, cover,
-page-count hint, publisher, date, language, format, and translators. Work-level
-title, authors, cover, subjects, and fiction classification provide
-fallback metadata.
+### Frontend
 
-Selecting a suggestion fills only empty personal fields. The personal book
-remains authoritative for tracking and may use a different page count or title,
-or remain unlinked. Verified accounts create what the catalog is missing: when
-a search finds nothing, the app creates the Work and Edition, and resolves or
-creates the shared authors it needs. Bibliographic records are public whoever
-added them; operators curate them afterwards through the restricted catalog
-page. Reader comparisons on `/books/[workId]` include only records whose owners
-enabled book sharing through a public profile.
+- React + TypeScript for the UI and app logic
+- Vite as the application build and dev server
+- CSS styling with a warm, editorial, paper-inspired look
+- browser-side state for local journal data
 
-The collections, statuses, consent boundary, and admin operations are
-documented in [docs/catalog.md](docs/catalog.md). The migration and rollout
-boundary is in [MIGRATIONS.md](MIGRATIONS.md#shared-catalog-rollout).
+### Backend and data model
 
-## Requirements
+The project includes Firebase-backed infrastructure for richer experiences:
 
-- Node.js 22.18 or newer. `.nvmrc` pins the repository version.
-- npm.
-- Firebase CLI only for emulator and deployment work. Commands in this
-  repository pin the CLI version.
+- Firestore for user-owned records and shared catalog information
+- Authentication for signed-in flows
+- Cloud Functions for backend logic and integrations
+- shared catalog records for authors, works, and editions
+- operational tooling and data migrations for schema evolution
 
-## Set up the repository
+This means the app is not just a static local-only notebook: it can support richer
+book metadata, cross-user catalog linking, and server-side operations while keeping
+reader-owned records separate from shared bibliographic data.
 
-```bash
-git clone <repository-url>
-cd book-tracker
-npm ci
-npm --prefix functions ci
-```
+### Privacy model
 
-The repository already contains its Firebase configuration. Do not run
-`firebase init` in this checkout. It can replace tracked rules, indexes, and
-deployment settings.
+The core journaling experience is intentionally private. The personal reading
+journal remains a personal record, and the app's design emphasizes local use and
+owner-controlled data. Shared catalog metadata is deliberately separated from the
+private library so that readers keep ownership of their reading life while the app
+still benefits from common bibliographic information.
+
+> Your data is device-local unless you are using the account-backed features of the
+> app. Clearing browser site data or switching devices will not transfer the local
+> journal automatically. Back up or export important data before clearing storage.
+
+## Open the website
+
+Visit **[MARGIN](https://aromalsp123.github.io/Book-tracker/)** to open the live
+published site.
 
 ## Local development
 
-Use the emulators for application development. This exercises Authentication,
-Firestore, and Functions without sending application data or metered requests
-to deployed services.
-
-Start the emulators:
+Requirements: Node.js 22.18 or newer and npm.
 
 ```bash
-npm --prefix functions run serve
+git clone https://github.com/Aromalsp123/Book-tracker.git
+cd Book-tracker
+npm ci
+npm run dev
 ```
 
-In another terminal, route the browser client to them:
+Then open the URL printed by Vite, usually `http://localhost:5173`.
 
-```bash
-VITE_EMULATOR=1 npm run dev
-```
-
-Open `http://localhost:5173`.
-
-Plain `npm run dev` does not enable the emulators. It uses the Firebase
-configuration bundled with the application and should be used only by someone
-who understands and is authorized to access that environment. App Check is
-enforced there, so the dev client must present a registered debug token: put
-it in a gitignored `.env.local` as `VITE_APPCHECK_DEBUG_TOKEN` (register the
-value under App Check → Apps → Manage debug tokens, or via the
-`firebaseappcheck` REST API). Without it the SDK prints a fresh token to the
-browser console and every request is refused until that token is registered.
-Never commit a debug token — it bypasses attestation for whoever holds it.
-
-### Build and preview
+### Production build
 
 ```bash
 npm run build
 npm run preview
 ```
 
-The static build goes to `public/`. The build also creates the matching HTML
-shell used for public profile rendering. Treat both outputs as one release
-artifact.
+This produces a build that can be previewed locally. The project also includes
+release and deployment scripts for GitHub Pages and Firebase-backed services.
 
-### GitHub Pages
+## Testing and validation
 
-For the repository site at `https://aromalsp123.github.io/Book-tracker/`, set
-**Settings → Pages → Build and deployment → Source** to **GitHub Actions**.
-The workflow in `.github/workflows/pages.yml` builds the app with the repository
-path as its asset base and deploys the generated `public/` directory whenever
-`main` is updated. Local builds continue to use the domain root.
+The repository includes a substantial test suite for the frontend, Firebase rules,
+backend behavior, and catalog/data validation.
 
-## Testing
-
-Run the default test suite:
+Useful commands:
 
 ```bash
-npm test
+npm run check
+npm run test:unit
+npm run test:rules
+npm run test:pwa
+npm run test:functions
+npm run build
 ```
 
-Run the release validation suite before a deployment:
+The project also has a larger validation entry point:
 
 ```bash
 npm run validate
 ```
 
-`validate` runs type and framework checks, unit tests, rules and emulator
-tests, PWA tests, Functions tests, a production build, artifact checks, bundle
-budgets, and dependency audits. The root audit excludes development-only
-packages; the Functions audit checks its complete package tree.
+This is useful before release or when making changes to the app's data model,
+server rules, integrations, or metadata flows.
 
-Maintained source, tests, configuration, and repository tooling are
-TypeScript-only. `public/service-worker.js` is the sole JavaScript exception:
-it is generated from `src/service-worker.ts` during the build. Unit tests
-enforce both this boundary and the absence of unchecked TypeScript escape
-hatches.
+## Project structure
 
-Root package commands:
+A quick overview of the repository layout:
 
-| Command | Purpose |
-|---|---|
-| `npm run dev` | Start the Vite development server |
-| `npm run build` | Production build and renderer-shell synchronization |
-| `npm run preview` | Preview the production build locally |
-| `npm test` | Default checks and automated test suite |
-| `npm run validate` | Release validation, build, artifact and bundle checks, and audits |
-| `npm run check` | Svelte and TypeScript checks for the app, Node tools, and service worker |
-| `npm run check:app` | SvelteKit synchronization and Svelte checks |
-| `npm run check:node` | Type-check repository Node tools |
-| `npm run check:service-worker` | Type-check the service worker |
-| `npm run check:watch` | Watch-mode Svelte checks |
-| `npm run test:unit` | Application and migration unit tests |
-| `npm run test:rules` | Firestore Rules and integration tests against local emulators |
-| `npm run test:time-tracking-local` | Opt-in real Firestore/isolated Threeggle contract test; requires the dedicated local endpoint and timer token described in [the release runbook](docs/time-tracking-release.md) |
-| `npm run test:catalog-emulator` | Restricted catalog preview/apply workflow against local emulators |
-| `npm run test:functions` | Functions lint, production build, strict test type-check, and tests |
-| `npm run test:pwa` | Service-worker and PWA behavior tests |
-| `npm run test:artifacts` | Generated build and renderer artifact checks |
-| `npm run test:bundle` | JavaScript and CSS bundle budgets |
-| `npm run test:e2e` | Browser tests against local emulators |
-| `npm run test:e2e:browser` | Run Playwright against an already running test environment |
-| `npm run pages:assemble` | Assemble the Cloudflare Pages upload directory (`.pages-dist/`: the build plus the worker) |
-| `npm run pages:deploy` | Assemble and deploy the site to Cloudflare Pages with the pinned wrangler |
-| `npm run pages:purge` | Purge the Cloudflare edge cache so a release is visible before the TTL expires |
-| `npm run deploy:backend` | Deploy the backend (functions, rules, indexes) with the pinned Firebase CLI |
-| `npm run release` | Routine release: `pages:deploy`, then `deploy:backend`, then `release:verify` |
-| `npm run release:verify` | Check that the live profile renderer and the live site were released from `HEAD` and agree on the app bundle |
-| `node docs/architecture/verify.ts` | Route coverage, image freshness, and map sanitization |
+```text
+book-tracker-master/
+├── src/                     # frontend app and shared logic
+├── functions/               # backend functions and server-side logic
+├── tests/                  # automated tests
+├── docs/                   # architecture, release notes, and technical docs
+├── public/                 # static assets and generated site output
+├── cloudflare/             # deployment assembly utilities
+├── MIGRATIONS.md           # migration history and data evolution notes
+├── package.json            # app scripts and dependencies
+├── vite.config.ts          # Vite setup
+├── firebase.json           # Firebase configuration
+├── firestore.rules        # Firestore security rules
+├── firestore.indexes.json  # Firestore indexes
+├── README.md              # project overview and contributor guide
+└── ...
+```
 
-Functions package commands:
+## Architecture notes
 
-| Command | Purpose |
-|---|---|
-| `npm --prefix functions test` | Lint and type-check production/test backend code, then run backend tests |
-| `npm --prefix functions run lint` | Lint backend TypeScript |
-| `npm --prefix functions run clean` | Remove compiled backend output |
-| `npm --prefix functions run build` | Compile backend TypeScript (copies `shared/` into `functions/src/shared` first) |
-| `npm --prefix functions run sync-shared` | Copy the app-and-functions shared modules into the functions source tree |
-| `npm --prefix functions run check:test` | Strictly type-check backend tests |
-| `npm --prefix functions run stage:emulator-secrets` | Stage checked-in local-only emulator credentials |
-| `npm --prefix functions run serve` | Build and start the local emulator suite |
-| `npm --prefix functions run shell` | Alias for the emulator workflow |
-| `npm --prefix functions start` | Alias for the emulator workflow |
-| `npm --prefix functions run deploy` | Deploy backend services with the pinned CLI |
-| `npm --prefix functions run logs` | Read backend logs with the pinned CLI |
+The project includes technical documentation in the `docs/` directory that explains
+how responsibilities are split across the browser, server, and shared catalog. This
+is especially valuable when working with routing, access boundaries, integrations,
+and release workflows.
 
-`npm test` intentionally omits the browser end-to-end suite, artifact checks,
-and bundle budgets. `npm run validate` adds artifact and bundle checks. Run
-`npm run test:e2e` separately when a change affects a complete browser flow.
+Key references:
 
-## Deployment
+- [`docs/architecture/README.md`](docs/architecture/README.md)
+- [`docs/catalog.md`](docs/catalog.md)
+- [`docs/time-tracking-release.md`](docs/time-tracking-release.md)
+- [`MIGRATIONS.md`](MIGRATIONS.md)
 
-Deployment requires authorized operator access and the private operational
-runbooks. This public README documents the safe release boundary, not project
-identifiers, service identities, secret names, quotas, incident commands, or
-recovery credentials.
+## Deployment and release
 
-For a routine release:
-
-1. Start from a clean branch and install locked dependencies with `npm ci` in
-   both package roots.
-2. Run `npm test` and any relevant browser end-to-end tests.
-3. Run `npm run build` and `node docs/architecture/verify.ts`.
-4. Review the generated web and profile-renderer artifacts together.
-5. Commit the source and generated artifacts.
-6. Run `npm run validate` from that clean commit. The artifact checks compare
-   the generated files with `HEAD`, so this step belongs after the artifact
-   commit and before deployment. Confirm the working tree remains clean.
-7. Release with `npm run release`, then follow the private verification and
-   rollback runbooks. It runs `npm run pages:deploy` (the site, to Cloudflare
-   Pages), then `npm run deploy:backend` (the pinned firebase-tools@15.24.0
-   CLI), then `npm run release:verify`.
+The app includes deployment scripts for static publishing and backend deployment:
 
 ```bash
+npm run pages:assemble
+npm run pages:deploy
+npm run deploy:backend
 npm run release
 ```
 
-`deploy:backend` is the pinned CLI:
+The production site is assembled into `public/`, and GitHub Pages deployment is
+used for the published app. At the same time, Firebase services are used for the
+app's backend and data layer.
 
-```bash
-npm exec --yes --package firebase-tools@15.24.0 -- firebase deploy
-```
+## Contributing
 
-The site and the public profile renderer are coupled: the renderer serves a
-shell synchronized from the site build, and Pages keeps only the bundle it was
-last given, so release both together, never one by itself. A site-only release
-leaves the renderer's shell pointing at bundle files the site no longer serves,
-and every direct load of a profile URL is then blank (2026-09-21). `npm run
-release:verify` fails in that state: it reads a rendered profile from the
-renderer's own origin, the site's index page, and the shell at `HEAD`, and
-requires all three to reference the same bundle files, each of which the site
-must serve as an asset rather than as the application shell. Run it on its own
-whenever the two sides may have drifted. `deploy:backend` also republishes the
-retired Firebase Hosting site, which only redirects to the canonical domain. A
-routine release must not rerun database migrations, legacy configuration
-exports, or completed rollout steps.
+Contributions are welcome if they improve the reading experience, strengthen the
+project architecture, or make the app more reliable and useful for readers.
 
-For any data-shape change, use [MIGRATIONS.md](MIGRATIONS.md) and the migration
-script's own header. Production migration timing and emergency procedures stay
-in private operator documentation.
+A few good starting points:
 
-## Project layout
+- improve reading summaries and dashboard views
+- refine the library and progress workflows
+- extend time-tracking and session recording reliability
+- improve metadata, validation, or book-linking flows
+- improve accessibility and reading comfort in the interface
 
-```text
-book-tracker/
-├── src/
-│   ├── lib/                 UI, stores, Firebase access, types, and utilities
-│   └── routes/              SvelteKit pages
-├── static/                  Static assets served from the site root (keep them small)
-├── docs/screenshots/        README screenshots, not deployed
-├── cloudflare/              Pages worker (routing, renderer proxy, edge cache, header policy, /__/auth/* hop to the Hosting action page) and its assembly script
-├── hosting-retired/         Redirect-only content for the retired Firebase Hosting site
-├── functions/
-│   ├── src/                 Backend services and event handlers
-│   └── test/                Functions tests
-├── tests/                   App, rules, migration, PWA, and artifact tests
-├── docs/architecture/       Sanitized map sources and rendered images
-├── migrate-*.ts             One-time and maintenance migration tools
-├── db-audit.ts              Read-only data consistency audit
-├── db-snapshot.ts           Snapshot tool used before migrations
-├── MIGRATIONS.md            Public-safe migration procedure and status ledger
-├── firestore.rules          Application data permissions
-├── firestore-secrets.rules  Restricted credential-store permissions
-└── firebase.json            Emulator and deployment configuration
-```
-
-## Technology
-
-- Svelte 5 and SvelteKit 2
-- Vite 7 and TypeScript 5
-- Bootstrap 5
-- Firebase Authentication, Firestore, and Functions
-- Cloudflare Pages for the site, with a worker that proxies public profile pages to the renderer
-- Node.js 22 for backend services and repository tools
-
-## Development notes
-
-- Pages use SvelteKit file-based routing under `src/routes`.
-- New components use Svelte 5 runes.
-- Browser writes preserve offline behavior through Firestore's local cache.
-- Navigation guards improve the user experience, but Rules and backend
-  authorization are the security boundaries.
-- Generated artifacts must match their source and committed revision.
-- Changes to routes, architecture, access, data flows, or integrations must
-  update and regenerate the maps.
-
-## Troubleshooting
-
-If the Node version is wrong:
-
-```bash
-nvm use
-```
-
-If dependencies are inconsistent, reinstall from the lockfiles:
-
-```bash
-npm ci
-npm --prefix functions ci
-```
-
-If an emulator command fails because a port is already in use, stop the other
-emulator process and rerun the command. Do not switch to deployed services as a
-shortcut.
-
-## Release history
-
-Version 2 is the current application line. Earlier framework-upgrade notes are
-historical and no longer part of setup or deployment. Database rollout status
-is recorded in [MIGRATIONS.md](MIGRATIONS.md).
+Before submitting substantial changes, review the docs in `docs/` and the project
+scripts in `package.json` so that the work matches the repo's testing and release
+patterns.
 
 ## License
 
-MIT
+No license has been specified for this project. Contact the repository owner before
+reusing or redistributing the source, artwork, or published content.
