@@ -135,7 +135,7 @@ still benefits from common bibliographic information.
 
 ## Open the website
 
-Visit **[MARGIN]([https://aromalsp123.github.io/Book-tracker/](https://aromalsp123.github.io/Book-tracker/))** to open the live
+Visit **[MARGIN](https://aromalsp123.github.io/Book-tracker/)** to open the live website
 published site.
 
 ## Local development
