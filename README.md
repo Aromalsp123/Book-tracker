@@ -135,7 +135,7 @@ still benefits from common bibliographic information.
 
 ## Open the website
 
-Visit **[MARGIN](https://aromalsp123.github.io/Book-tracker/)** to open the live
+Visit **[MARGIN]([https://aromalsp123.github.io/Book-tracker/](https://aromalsp123.github.io/Book-tracker/))** to open the live
 published site.
 
 ## Local development
@@ -191,7 +191,7 @@ server rules, integrations, or metadata flows.
 A quick overview of the repository layout:
 
 ```text
-book-tracker-master/
+book-tracker/
 ├── src/                     # frontend app and shared logic
 ├── functions/               # backend functions and server-side logic
 ├── tests/                  # automated tests
@@ -201,9 +201,6 @@ book-tracker-master/
 ├── MIGRATIONS.md           # migration history and data evolution notes
 ├── package.json            # app scripts and dependencies
 ├── vite.config.ts          # Vite setup
-├── firebase.json           # Firebase configuration
-├── firestore.rules        # Firestore security rules
-├── firestore.indexes.json  # Firestore indexes
 ├── README.md              # project overview and contributor guide
 └── ...
 ```
