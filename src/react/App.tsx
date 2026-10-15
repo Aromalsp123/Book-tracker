@@ -198,7 +198,7 @@ function LandingPage({ onEnter, onSearch }: { onEnter: () => void; onSearch: (qu
         <h1>Make room for<br />more <span className="highlight-word">stories.</span></h1>
         <p className="hero-byline">Your books, your own little corner of the world.</p>
         <p className="hero-description">Keep the stories you’re reading, the ones you’ve loved, and the lines you want to remember—all together in one thoughtful reading journal.</p>
-        <div className="hero-actions"><button className="button landing-cta hero-cta" type="button" onClick={onEnter}>Start your journal <Icon name="arrow-right" /></button><a className="hero-secondary" href="#features">Take a look around <Icon name="arrow-down" /></a></div>
+        <div className="hero-actions"><div className="hero-primary-action"><button className="button landing-cta hero-cta" type="button" onClick={onEnter}>Start your journal <Icon name="arrow-right" /></button><p className="hero-powered-by">Powered by Globocon</p></div><a className="hero-secondary" href="#features">Take a look around <Icon name="arrow-down" /></a></div>
         <div className="hero-benefits"><div><span className="benefit-icon"><Icon name="book" /></span><span>Your personal library</span></div><div><span className="benefit-icon"><Icon name="clock" /></span><span>Reading sessions</span></div><div><span className="benefit-icon"><Icon name="quote" /></span><span>Favorite passages</span></div></div>
       </div>
       <div className="landing-art-wrap"><div className="art-orbit art-orbit-one" /><div className="art-orbit art-orbit-two" /><LandingIllustration /><span className="art-small-star art-star-one">✦</span><span className="art-small-star art-star-two">✦</span></div>

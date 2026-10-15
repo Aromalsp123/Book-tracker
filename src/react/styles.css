@@ -501,10 +501,12 @@ h1, h2, h3 { font-family: var(--serif); font-weight: 400; }
 .highlight-word { display: inline-block; padding: 0 .07em .05em; background: linear-gradient(transparent 23%, #ddbB59 23%, #ddbB59 90%, transparent 90%); }
 .hero-byline { margin: 17px 0 0; color: #625b50; font: 1.01rem var(--serif); }
 .hero-description { max-width: 495px; margin: 22px 0 0; color: #625e55; font: .91rem/1.75 var(--serif); }
-.hero-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 22px; margin-top: 24px; }
+.hero-actions { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 22px; margin-top: 24px; }
+.hero-primary-action { display: flex; flex-direction: column; align-items: center; gap: 4px; }
 .hero-cta { min-height: 44px; padding: 0 20px; font-size: .76rem; }
-.hero-secondary { display: inline-flex; align-items: center; gap: 8px; color: #726b5e; font-size: .72rem; text-decoration: none; }
+.hero-secondary { display: inline-flex; align-items: center; gap: 8px; margin-top: 13px; color: #726b5e; font-size: .72rem; text-decoration: none; }
 .hero-secondary:hover { color: #527da4; }
+.hero-powered-by { margin: 0; color: #777168; font-size: .65rem; text-align: center; }
 .hero-benefits { display: flex; flex-wrap: wrap; gap: 12px 22px; margin-top: 44px; padding-top: 18px; border-top: 1px solid #ded5c5; }
 .hero-benefits > div { display: flex; align-items: center; gap: 7px; color: #777168; font-size: .65rem; }
 .benefit-icon { display: grid; width: 25px; height: 25px; place-items: center; border-radius: 50%; background: #eee6d7; color: #5d7180; }
@@ -574,7 +576,7 @@ h1, h2, h3 { font-family: var(--serif); font-weight: 400; }
   .landing-copy h1 { font-size: clamp(3.25rem, 13vw, 5rem); }
   .hero-byline { margin-top: 12px; font-size: .9rem; }
   .hero-description { margin-top: 14px; font-size: .82rem; }
-  .hero-actions { gap: 17px; margin-top: 19px; }
+  .hero-actions { column-gap: 17px; margin-top: 19px; }
   .hero-benefits { gap: 10px 14px; margin-top: 24px; padding-top: 13px; }
   .hero-benefits > div { gap: 5px; font-size: .58rem; }
   .benefit-icon { width: 23px; height: 23px; font-size: .78rem; }
@@ -608,6 +610,11 @@ h1, h2, h3 { font-family: var(--serif); font-weight: 400; }
   .landing-footer-invitation .button { padding: 0 12px; font-size: .67rem; }
   .landing-footer-bottom { flex-wrap: wrap; margin-top: 23px; }
   .landing-footer-bottom small:nth-child(2) { order: 1; width: 100%; text-align: center; }
+}
+
+@media (max-width: 335px) {
+  .hero-actions { flex-direction: column; gap: 10px; }
+  .hero-secondary { margin-top: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
